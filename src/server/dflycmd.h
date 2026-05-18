@@ -40,6 +40,8 @@ struct FlowInfo {
 
   facade::Connection* conn = nullptr;
 
+  // Owned by the shard that this flow corresponds to; only that shard's proactor
+  // ever reads or writes these pointers, so no synchronization is needed.
   std::unique_ptr<RdbSaver> saver;            // Saver for full sync phase.
   std::unique_ptr<JournalStreamer> streamer;  // Streamer for stable sync phase
   std::string eof_token;
@@ -47,7 +49,7 @@ struct FlowInfo {
   DflyVersion version = DflyVersion::VER1;
 
   std::optional<LSN> start_partial_sync_at;
-  uint64_t last_acked_lsn = 0;
+  std::atomic<uint64_t> last_acked_lsn = 0;
 
   std::function<void()> cleanup;  // Optional cleanup for cancellation.
 };
@@ -115,7 +117,8 @@ class DflyCmd {
     // Transition into cancelled state, run cleanup.
     void Cancel();
 
-    SyncState replica_state;  // always guarded by shared_mu
+    // Transitions still serialized under shared_mu; atomic so readers can load lock-free.
+    std::atomic<SyncState> replica_state;
     ExecutionState exec_st;
 
     std::string id;
@@ -156,6 +159,8 @@ class DflyCmd {
 
   // Tries to break those flows that stuck on socket write for too long time.
   void BreakStalledFlowsInShard() ABSL_NO_THREAD_SAFETY_ANALYSIS;
+
+  using ReplicaInfoMap = absl::btree_map<uint32_t, std::shared_ptr<ReplicaInfo>>;
 
  private:
   // JOURNAL [START/STOP]
@@ -227,12 +232,15 @@ class DflyCmd {
 
   // Return a map between replication ID to lag. lag is defined as the maximum of difference
   // between the master's LSN and the last acknowledged LSN in over all shards.
-  std::map<uint32_t, LSN> ReplicationLagsLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  std::map<uint32_t, LSN> ReplicationLags(const ReplicaInfoMap& replicas) const;
+
+  // Publishes a fresh copy of replica_infos_ to a thread-local on every proactor.
+  // Caller must hold mu_. Readers (INFO/metrics) load this view lock-free.
+  void UpdateReplicaInfoState() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   ServerFamily* sf_;  // Not owned
   uint32_t next_sync_id_ = 1;
 
-  using ReplicaInfoMap = absl::btree_map<uint32_t, std::shared_ptr<ReplicaInfo>>;
   ReplicaInfoMap replica_infos_ ABSL_GUARDED_BY(mu_);
 
   mutable util::fb2::Mutex mu_;  // Guard global operations. See header top for locking levels.
