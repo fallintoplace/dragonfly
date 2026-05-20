@@ -96,20 +96,18 @@ bool WaitReplicaFlowToCatchup(absl::Time end_time, const DflyCmd::ReplicaInfo* r
 
   const FlowInfo* flow = &replica->flows[shard->shard_id()];
 
-  while (true) {
-    uint64_t acked = flow->last_acked_lsn.load(std::memory_order_relaxed);
-    if (acked >= journal::GetLsn())
-      break;
+  while (flow->last_acked_lsn < journal::GetLsn()) {
     if (absl::Now() > end_time) {
       LOG(WARNING) << "Couldn't synchronize with replica for takeover in time: " << replica->address
-                   << ":" << replica->listening_port << ", last acked: " << acked << ", expecting "
-                   << journal::GetLsn();
+                   << ":" << replica->listening_port << ", last acked: " << flow->last_acked_lsn
+                   << ", expecting " << journal::GetLsn();
       return false;
     }
     if (!replica->exec_st.IsRunning()) {
       return false;
     }
-    LOG_EVERY_T(INFO, 1) << "Replica lsn:" << acked << " master lsn:" << journal::GetLsn()
+    LOG_EVERY_T(INFO, 1) << "Replica lsn:" << flow->last_acked_lsn
+                         << " master lsn:" << journal::GetLsn()
                          << "; Journal streamer state: " << flow->streamer->FormatInternalState();
     ThisFiber::SleepFor(1ms);
   }
@@ -786,6 +784,10 @@ auto DflyCmd::CreateSyncSession(ConnectionState* state) -> std::pair<uint32_t, u
 
   auto replica_ptr =
       make_shared<ReplicaInfo>(flow_count, std::move(address), port, std::move(err_handler));
+  // Capture the proactor running the main control connection. CLIENT-ID and CLIENT-VERSION
+  // arrive on this same connection, so their writes execute here; cross-thread readers of
+  // id/version hop via owner_thread->AwaitBrief.
+  replica_ptr->owner_thread = ProactorBase::me();
   auto [it, inserted] = replica_infos_.emplace(sync_id, std::move(replica_ptr));
   CHECK(inserted);
 
@@ -888,8 +890,11 @@ std::vector<ReplicaRoleInfo> DflyCmd::GetReplicasRoleInfo() const {
     SyncState state = info->replica_state.load(std::memory_order_relaxed);
     // Lag is undefined unless the replica is in stable sync.
     LSN lag = (state == SyncState::STABLE_SYNC) ? replication_lags[id] : 0;
-    vec.push_back(
-        ReplicaRoleInfo{info->id, info->address, info->listening_port, SyncStateName(state), lag});
+    // info->id is written by the CLIENT-ID handler on info->owner_thread; copy it from
+    // that same proactor to avoid a data race on std::string.
+    std::string replica_id = info->owner_thread->AwaitBrief([&info] { return info->id; });
+    vec.push_back(ReplicaRoleInfo{std::move(replica_id), info->address, info->listening_port,
+                                  SyncStateName(state), lag});
   }
   return vec;
 }
@@ -964,7 +969,7 @@ std::map<uint32_t, LSN> DflyCmd::ReplicationLags(const ReplicaInfoMap& replicas)
       const ReplicaInfo* replica = info.second.get();
       if (replica->replica_state.load(std::memory_order_relaxed) != SyncState::STABLE_SYNC)
         continue;
-      LSN acked = replica->flows[shard->shard_id()].last_acked_lsn.load(std::memory_order_relaxed);
+      LSN acked = replica->flows[shard->shard_id()].last_acked_lsn;
       lags[info.first] = cur_lsn > acked ? cur_lsn - acked : 0;
     }
   });

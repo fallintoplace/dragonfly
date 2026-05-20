@@ -19,6 +19,9 @@ class RedisReplyBuilder;
 
 namespace util {
 class ListenerInterface;
+namespace fb2 {
+class ProactorBase;
+}  // namespace fb2
 }  // namespace util
 
 namespace dfly {
@@ -49,7 +52,8 @@ struct FlowInfo {
   DflyVersion version = DflyVersion::VER1;
 
   std::optional<LSN> start_partial_sync_at;
-  std::atomic<uint64_t> last_acked_lsn = 0;
+  // Written by REPLCONF ACK on the owner-shard proactor; all readers also run there.
+  uint64_t last_acked_lsn = 0;
 
   std::function<void()> cleanup;  // Optional cleanup for cancellation.
 };
@@ -121,10 +125,13 @@ class DflyCmd {
     std::atomic<SyncState> replica_state;
     ExecutionState exec_st;
 
+    // id is written by the REPLCONF CLIENT-ID handler on owner_thread; readers from
+    // other threads must hop via owner_thread->AwaitBrief to avoid a data race.
     std::string id;
     std::string address;
     uint32_t listening_port;
     DflyVersion version = DflyVersion::VER1;
+    util::fb2::ProactorBase* owner_thread = nullptr;
 
     // Flows describe the state of shard-local flow.
     // They are always indexed by the shard index on the master.

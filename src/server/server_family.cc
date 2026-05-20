@@ -4238,7 +4238,7 @@ void ServerFamily::ReplConf(CmdArgList args, CommandContext* cmd_cntx) {
         return;
       }
       VLOG(2) << "Received client ACK=" << ack;
-      cntx->master_repl_flow->last_acked_lsn.store(ack, std::memory_order_relaxed);
+      cntx->master_repl_flow->last_acked_lsn = ack;
       return;
     } else {
       VLOG(1) << "Error " << cmd << " " << arg << " " << args.size();
