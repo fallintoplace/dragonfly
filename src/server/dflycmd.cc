@@ -969,8 +969,7 @@ std::map<uint32_t, LSN> DflyCmd::ReplicationLags(const ReplicaInfoMap& replicas)
       const ReplicaInfo* replica = info.second.get();
       if (replica->replica_state.load(std::memory_order_relaxed) != SyncState::STABLE_SYNC)
         continue;
-      LSN acked = replica->flows[shard->shard_id()].last_acked_lsn;
-      lags[info.first] = cur_lsn > acked ? cur_lsn - acked : 0;
+      lags[info.first] = cur_lsn - replica->flows[shard->shard_id()].last_acked_lsn;
     }
   });
 
