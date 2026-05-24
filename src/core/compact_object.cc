@@ -403,6 +403,40 @@ static_assert(sizeof(CompactObj) == 18);
 
 namespace detail {
 
+// Thread-local callback invoked by LargeString when its `ptr` is about to be
+// released (via Free or SetString growth) while read_pending=1. The callback
+// takes ownership of `ptr` — it must NOT be deallocated here. Typically the
+// callback hands the pointer off to the owning shard's PendingRead registry
+// so it's freed only after the last outstanding read pin is released.
+//
+// Set via CompactObj::SetLargeStringOrphanCallback during shard startup.
+thread_local LargeStringOrphanFn on_large_str_orphan = nullptr;
+
+void SetLargeStringOrphanCallback(LargeStringOrphanFn fn) {
+  on_large_str_orphan = fn;
+}
+
+// Release the current ptr: orphans into the pending-read registry if a pin
+// is active, otherwise deallocates normally. After the call, ls->ptr is
+// nullptr and read_pending is cleared. Safe even if read_pending was set
+// but the registry entry was already drained (no active pin found) —
+// falls through to the deallocate path in that case.
+static void ReleasePtr(LargeString* ls, LargeString::MemoryResource* mr) {
+  if (ls->ptr == nullptr) {
+    ls->SetReadPending(false);
+    return;
+  }
+  bool orphaned = false;
+  if (ls->IsReadPending() && on_large_str_orphan != nullptr) {
+    orphaned = on_large_str_orphan(ls->ptr);
+  }
+  if (!orphaned) {
+    mr->deallocate(ls->ptr, 0, kAlignSize);
+  }
+  ls->ptr = nullptr;
+  ls->SetReadPending(false);
+}
+
 size_t LargeString::MallocUsed() const {
   return zmalloc_size(ptr);
 }
@@ -413,11 +447,16 @@ uint64_t LargeString::HashCode() const {
 }
 
 void LargeString::SetString(string_view s, MemoryResource* mr) {
-  if (s.size() > zmalloc_size(ptr)) {
-    if (ptr) {
-      mr->deallocate(ptr, 0, kAlignSize);
-    }
-    ptr = mr->allocate(s.size(), kAlignSize);
+  // Two cases force a fresh allocation:
+  //   (a) the new value doesn't fit in the existing buffer; or
+  //   (b) read_pending=1 — in-place overwrite would corrupt bytes that
+  //       pinned readers may still be reading. ReleasePtr orphans the
+  //       buffer to the pending-read registry if a pin is active.
+  bool needs_new_buf = (s.size() > zmalloc_size(ptr)) || IsReadPending();
+  if (needs_new_buf) {
+    ReleasePtr(this, mr);
+    if (s.size() > 0)
+      ptr = mr->allocate(s.size(), kAlignSize);
   }
   if (!s.empty()) {
     memcpy(ptr, s.data(), s.size());
@@ -433,6 +472,11 @@ void LargeString::ReserveString(size_t size, MemoryResource* mr) {
 void LargeString::AppendString(string_view s, MemoryResource* mr) {
   size_t cur_cap = zmalloc_size(ptr);
   CHECK(cur_cap >= sz + s.size()) << cur_cap << " " << sz << " " << s.size();
+  // AppendString mutates the existing buffer in place — that would corrupt
+  // pinned readers. Callers must ensure read_pending is not set when
+  // appending. (Today the only AppendString site is rdb_load, which never
+  // produces values that have been pinned.)
+  DCHECK(!IsReadPending());
   memcpy(reinterpret_cast<uint8_t*>(ptr) + sz, s.data(), s.size());
   sz += s.size();
 }
@@ -440,13 +484,17 @@ void LargeString::AppendString(string_view s, MemoryResource* mr) {
 void LargeString::Free(MemoryResource* mr) {
   if (!ptr)
     return;
-
-  mr->deallocate(ptr, 0, 8);  // we do not keep the allocated size.
-  ptr = nullptr;
+  // ReleasePtr orphans into the pending-read registry when read_pending is
+  // set and an active pin exists; otherwise deallocates normally.
+  ReleasePtr(this, mr);
   sz = 0;
 }
 
 bool LargeString::DefragIfNeeded(PageUsage* page_usage) {
+  // Defrag would reallocate the underlying buffer and invalidate any
+  // outstanding borrowed views. Skip if readers are pinning it.
+  if (IsReadPending())
+    return false;
   if (page_usage->IsPageForObjectUnderUtilized(ptr)) {
     ReallocateString(tl.local_mr);
     return true;
@@ -928,6 +976,12 @@ void CompactObj::ReserveString(size_t size) {
 void CompactObj::AppendString(std::string_view str) {
   DCHECK_EQ(taglen_, LARGE_STR_TAG);
   u_.large_str.AppendString(str, tl.local_mr);
+}
+
+void CompactObj::MarkReadPending() const {
+  DCHECK_EQ(taglen_, LARGE_STR_TAG);
+  // The bit is bookkeeping; safe to mutate on an otherwise-const PrimeValue.
+  const_cast<detail::LargeString&>(u_.large_str).SetReadPending(true);
 }
 
 std::optional<std::string_view> CompactObj::TryGetRawView() const {

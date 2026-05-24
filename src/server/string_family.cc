@@ -67,8 +67,14 @@ template <typename T> using TResultOrT = variant<T, TieredStorage::TResult<T>>;
 // Strong-typed tag for a borrowed view into shard storage. Distinct from
 // std::string_view in the variant to avoid implicit-conversion ambiguity
 // with std::string elsewhere.
+//
+// `pin` is the PendingRead* registered with the owning shard at borrow
+// time. The reply path hands it off to SinkReplyBuilder::AddPostSendPin so
+// it's released after the socket write completes. Null when the borrow path
+// is not engaged (e.g. fallback to an owned std::string).
 struct BorrowedString {
   std::string_view view;
+  PendingRead* pin = nullptr;
 };
 
 // StringResult adds a borrowed-view alternative on top of the generic
@@ -99,7 +105,14 @@ StringResult ReadStringBorrow(DbIndex dbid, string_view key, const PrimeValue& p
   if (zero_copy_enabled && !pv.IsExternal()) {
     if (auto view = pv.TryGetRawView()) {
       ++es->stats().borrowed_string_views_total;
-      return StringResult{BorrowedString{*view}};
+      // Register a read pin on this shard. The pin keeps the buffer alive
+      // even if a concurrent mutation (SET/APPEND/DEL/expiry) runs on the
+      // same key before the reply is flushed — the writer will orphan the
+      // buffer instead of freeing it, and the owning shard reclaims it
+      // when the last reader unpins.
+      PendingRead* pin = es->PinRead(const_cast<void*>(static_cast<const void*>(view->data())));
+      pv.MarkReadPending();
+      return StringResult{BorrowedString{*view, pin}};
     }
   }
   return ReadString(dbid, key, pv, es);
@@ -733,7 +746,16 @@ struct GetReplies {
       // real sink — without this, SendBulkString materializes a
       // std::string and defeats the MVP on pipelined workloads.
       ++ServerState::tlocal()->stats.borrowed_strings_sent_total;
-      return rb->SendBulkStringBorrowed(get<BorrowedString>(res).view);
+      auto& bs = get<BorrowedString>(res);
+      rb->SendBulkStringBorrowed(bs.view);
+      // Register the pin so it's released after the socket write completes.
+      // Order matters: register AFTER SendBulkStringBorrowed so any internal
+      // Flush triggered by IOV_MAX (which drains existing post-send pins)
+      // happens before our pin is added — otherwise we could unpin before
+      // the view's bytes hit the socket.
+      if (bs.pin)
+        rb->AddPostSendPin(bs.pin);
+      return;
     }
     auto fut = get<TieredStorage::TResult<std::string>>(std::move(res));
     io::Result<std::string> iores = fut.Get();

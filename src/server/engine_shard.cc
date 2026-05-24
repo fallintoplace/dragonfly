@@ -14,6 +14,7 @@
 #include "core/huff_coder.h"
 #include "core/page_usage/page_usage_stats.h"
 #include "core/qlist.h"
+#include "facade/reply_builder.h"
 #include "io/proc_reader.h"
 
 extern "C" {
@@ -486,6 +487,90 @@ void EngineShard::Shutdown() {
   queue2_.Shutdown();
   DCHECK(!fiber_heartbeat_periodic_.IsJoinable());
   DCHECK(!fiber_shard_handler_periodic_.IsJoinable());
+
+  // Drain any residual pending-read entries — at shutdown there shouldn't be
+  // any active readers, but we may have orphans that were waiting for the
+  // owning shard to reclaim them.
+  DrainPendingReads();
+  for (auto& [ptr, pin] : pending_read_map_) {
+    if (pin->orphaned)
+      mi_resource_.deallocate(pin->ptr, 0, 8);
+    delete pin;
+  }
+  pending_read_map_.clear();
+}
+
+PendingRead* EngineShard::PinRead(void* ptr) {
+  DCHECK(IsMyThread());
+  DCHECK(ptr != nullptr);
+
+  auto it = pending_read_map_.find(ptr);
+  if (it == pending_read_map_.end()) {
+    PendingRead* entry = new PendingRead{};
+    entry->ptr = ptr;
+    entry->refcnt.store(1, std::memory_order_relaxed);
+    entry->owner_shard = this;
+    pending_read_map_[ptr] = entry;
+    return entry;
+  }
+  // Existing entry: incrementing from N>0 to N+1 is always safe here. The
+  // entry can only have been re-pinned (refcnt>0) or be sitting at refcnt=0
+  // awaiting drain. In the latter case, bumping refcnt back above 0 simply
+  // means DrainPendingReads will observe it as non-zero and skip cleanup —
+  // the entry stays alive.
+  it->second->refcnt.fetch_add(1, std::memory_order_relaxed);
+  return it->second;
+}
+
+void EngineShard::UnpinRead(PendingRead* pin) {
+  DCHECK(pin != nullptr);
+  // release ordering: pair with the shard's acquire on observed refcnt==0
+  // before deciding to free / erase.
+  if (pin->refcnt.fetch_sub(1, std::memory_order_release) == 1) {
+    pin->owner_shard->pending_read_free_list_.Push(pin);
+  }
+}
+
+bool EngineShard::OrphanLargeStringPtr(void* ptr) {
+  DCHECK(IsMyThread());
+  auto it = pending_read_map_.find(ptr);
+  if (it == pending_read_map_.end()) {
+    // No active pin — the previous read either never pinned this exact
+    // buffer (unusual but possible) or has already been drained out of
+    // the map. Either way, the buffer is not owned by the pending-read
+    // registry and the caller must free it normally.
+    return false;
+  }
+  it->second->orphaned = true;
+  pending_read_map_.erase(it);
+  return true;
+}
+
+void EngineShard::DrainPendingReads() {
+  DCHECK(IsMyThread());
+  while (PendingRead* pin = pending_read_free_list_.Pop()) {
+    // acquire ordering: pair with UnpinRead's release on the last fetch_sub
+    // — also catches any racing re-pin before we decide whether to free.
+    if (pin->refcnt.load(std::memory_order_acquire) > 0) {
+      // Re-pinned after enqueue. Leave it in place; the next unpin that
+      // takes refcnt to 0 will re-enqueue.
+      continue;
+    }
+    if (pin->orphaned) {
+      // The CompactObj has moved on; this entry owns the buffer. Free on
+      // our heap (we are the owning shard).
+      mi_resource_.deallocate(pin->ptr, 0, 8);
+    } else {
+      // Still attached to a live CompactObj (no mutation happened during
+      // the read window). Drop the map entry so future pins create a fresh
+      // PendingRead; the CompactObj's LargeString may still have
+      // read_pending set, but the next Pin will just create a new entry.
+      auto it = pending_read_map_.find(pin->ptr);
+      if (it != pending_read_map_.end() && it->second == pin)
+        pending_read_map_.erase(it);
+    }
+    delete pin;
+  }
 }
 
 void EngineShard::StopPeriodicFiber() {
@@ -568,6 +653,19 @@ void EngineShard::InitThreadLocal(ProactorBase* pb) {
   CompactObj::InitThreadLocal(shard_->memory_resource());
   SmallString::InitThreadLocal(data_heap);
   InitTLStatelessAllocMR(shard_->memory_resource());
+
+  // Register the orphan callback so LargeString::Free/SetString hand off
+  // pinned buffers to this shard's PendingRead registry instead of
+  // deallocating them inline. Captures `shard_` via the thread-local; the
+  // callback runs synchronously on this shard's thread.
+  detail::SetLargeStringOrphanCallback(
+      +[](void* ptr) -> bool { return EngineShard::tlocal()->OrphanLargeStringPtr(ptr); });
+
+  // Install the global post-send pin release. Idempotent across shards;
+  // first thread to come up wins. Forwards to EngineShard::UnpinRead which
+  // routes the decrement to the pin's owner shard.
+  facade::SinkReplyBuilder::SetPostSendUnpinFn(
+      +[](void* pin) { EngineShard::UnpinRead(static_cast<PendingRead*>(pin)); });
 
   shard_->shard_search_indices_ = std::make_unique<ShardDocIndices>();
 }
@@ -751,6 +849,10 @@ void EngineShard::RemoveContTx(Transaction* tx) {
 void EngineShard::Heartbeat() {
   DVLOG(3) << " Hearbeat";
   DCHECK(namespaces);
+
+  // Reclaim any zero-copy GET pins whose refcnt has dropped to 0 on a
+  // remote IO thread. Cheap and idempotent.
+  DrainPendingReads();
 
   CacheStats();
 

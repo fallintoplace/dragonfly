@@ -1094,4 +1094,71 @@ TEST_F(StringFamilyTest, GetLargeRawBorrowedSquashed) {
   EXPECT_EQ(get_info_stat("borrowed_strings_sent_total"), initial_sent + 3);
 }
 
+// Exercises the EngineShard PendingRead registry directly: pin a freshly
+// allocated buffer, simulate an orphan (writer overwrites the value), unpin,
+// and drain. Verifies refcnt accounting, the orphan flag, and that drain
+// reclaims the orphaned buffer without crashing. ASAN catches any
+// double-free or leak.
+TEST_F(StringFamilyTest, PendingReadPinOrphanDrain) {
+  pp_->at(0)->Await([&] {
+    auto* shard = EngineShard::tlocal();
+    constexpr size_t kBufSize = 2048;
+    void* buf = shard->memory_resource()->allocate(kBufSize, 8);
+
+    // First reader pins.
+    PendingRead* pin = shard->PinRead(buf);
+    ASSERT_NE(pin, nullptr);
+    EXPECT_EQ(pin->ptr, buf);
+    EXPECT_EQ(pin->refcnt.load(), 1u);
+    EXPECT_FALSE(pin->orphaned);
+    EXPECT_EQ(pin->owner_shard, shard);
+
+    // Second reader pins same buffer — same entry, refcnt bumps.
+    PendingRead* pin2 = shard->PinRead(buf);
+    EXPECT_EQ(pin2, pin);
+    EXPECT_EQ(pin->refcnt.load(), 2u);
+
+    // Simulate a writer mutating the value: orphan the buffer.
+    EXPECT_TRUE(shard->OrphanLargeStringPtr(buf));
+    EXPECT_TRUE(pin->orphaned);
+
+    // A second orphan attempt on the same ptr returns false (already
+    // removed from the map).
+    EXPECT_FALSE(shard->OrphanLargeStringPtr(buf));
+
+    // One reader unpins — refcnt 2 -> 1, no free yet.
+    EngineShard::UnpinRead(pin);
+    EXPECT_EQ(pin->refcnt.load(), 1u);
+
+    // Last reader unpins — refcnt 1 -> 0, pushed to free_list.
+    EngineShard::UnpinRead(pin);
+
+    // Drain reclaims the orphaned buffer and deletes the pin entry.
+    shard->DrainPendingReads();
+  });
+}
+
+// Drain on a non-orphaned entry (no mutation during the read window) just
+// removes the entry from the map without freeing the buffer; the caller
+// retains ownership of the buffer for normal lifecycle management.
+TEST_F(StringFamilyTest, PendingReadDrainNonOrphaned) {
+  pp_->at(0)->Await([&] {
+    auto* shard = EngineShard::tlocal();
+    void* buf = shard->memory_resource()->allocate(1024, 8);
+
+    PendingRead* pin = shard->PinRead(buf);
+    EXPECT_EQ(pin->refcnt.load(), 1u);
+
+    // Unpin without orphaning — refcnt 1 -> 0, pushed.
+    EngineShard::UnpinRead(pin);
+
+    // Drain: not orphaned, so the buffer is NOT freed by drain. Just the
+    // map entry / pin struct go away.
+    shard->DrainPendingReads();
+
+    // The buffer is still ours to free.
+    shard->memory_resource()->deallocate(buf, 0, 8);
+  });
+}
+
 }  // namespace dfly

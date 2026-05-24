@@ -70,6 +70,21 @@ class SinkReplyBuilder {
 
   void Flush(size_t expected_buffer_cap = 0);  // Send all accumulated data and reset to clear state
 
+  // Register a pin to be released after the next Send() (i.e. after the
+  // socket write that consumes the currently accumulated iovecs completes).
+  // Used by the zero-copy GET path to keep shard-owned LargeString buffers
+  // alive across the borrowed-view send and then drop the read ref so the
+  // owning shard can reclaim the buffer if the value has been mutated.
+  //
+  // The pin is opaque to the reply builder (typed as void* to avoid pulling
+  // server/engine_shard.h into the facade). The release function must be
+  // installed once at startup via SetPostSendUnpinFn — see reply_builder.cc.
+  void AddPostSendPin(void* pin);
+
+  // Install the global release function for post-send pins. Typically wired
+  // by the server layer once at startup to call EngineShard::UnpinRead.
+  static void SetPostSendUnpinFn(void (*fn)(void*));
+
   std::error_code GetError() const {
     return ec_;
   }
@@ -144,6 +159,10 @@ class SinkReplyBuilder {
   absl::InlinedVector<iovec, 16> vecs_;
   size_t guaranteed_pieces_ = 0;   // length of prefix of vecs_ that are guaranteed to be pieces
   uint64_t send_time_cycles_ = 0;  // base::CycleClock::Now() at Send() entry, 0 when idle
+
+  // Pins to release after the next Send() completes. Cleared inside Send()
+  // before returning. Usually empty (only zero-copy GET adds entries).
+  absl::InlinedVector<void*, 4> post_send_pins_;
 };
 
 class MCReplyBuilder : public SinkReplyBuilder {

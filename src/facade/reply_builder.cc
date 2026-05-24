@@ -161,6 +161,24 @@ uint64_t SinkReplyBuilder::GetLastSendTimeCycles() const {
   return send_time_cycles_;
 }
 
+namespace {
+
+// Release function for post-send pins, installed by the server layer (see
+// dfly_main / EngineShard::InitThreadLocal). Allows reply_builder to remain
+// free of any server/engine_shard dependency. nullptr until installed.
+std::atomic<void (*)(void*)> g_post_send_unpin_fn{nullptr};
+
+}  // namespace
+
+void SinkReplyBuilder::SetPostSendUnpinFn(void (*fn)(void*)) {
+  g_post_send_unpin_fn.store(fn, std::memory_order_release);
+}
+
+void SinkReplyBuilder::AddPostSendPin(void* pin) {
+  DCHECK(pin != nullptr);
+  post_send_pins_.push_back(pin);
+}
+
 void SinkReplyBuilder::Send() {
   DCHECK(sink_ != nullptr);
   DCHECK(!vecs_.empty());
@@ -186,6 +204,19 @@ void SinkReplyBuilder::Send() {
   reply_stats.send_stats.count++;
   reply_stats.send_stats.total_duration += (after_cycles - pin.timestamp_cycles);
   DVLOG(2) << "Finished writing " << total_size_ << " bytes";
+
+  // Release any post-send pins (zero-copy GET). Cleanup runs even if the
+  // socket write errored — the pin's source storage is already done from
+  // the reader's perspective.
+  if (!post_send_pins_.empty()) {
+    auto* unpin = g_post_send_unpin_fn.load(std::memory_order_acquire);
+    DCHECK(unpin != nullptr) << "post-send pins set but no unpin fn registered";
+    if (unpin) {
+      for (void* p : post_send_pins_)
+        unpin(p);
+    }
+    post_send_pins_.clear();
+  }
 }
 
 void SinkReplyBuilder::FinishScope() {

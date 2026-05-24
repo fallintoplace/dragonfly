@@ -94,7 +94,20 @@ struct LargeString {
 
   void* ptr;
   uint64_t sz : 56;
-  uint64_t reserved : 8;
+  // Set while one or more readers borrow `ptr` (zero-copy GET). When set, a
+  // mutation (SetString/Free) must NOT free `ptr` directly — it hands the
+  // pointer off to the per-shard PendingRead registry via the
+  // OnLargeStringOrphan thread-local callback, which keeps the buffer alive
+  // until the last reader unpins.
+  uint64_t read_pending : 1;
+  uint64_t reserved : 7;
+
+  bool IsReadPending() const {
+    return read_pending != 0;
+  }
+  void SetReadPending(bool b) {
+    read_pending = b ? 1 : 0;
+  }
 
   size_t Size() const {
     return sz;
@@ -132,6 +145,19 @@ struct LargeString {
 } __attribute__((packed));
 
 static_assert(sizeof(LargeString) == 16);
+
+// Callback type invoked by LargeString when it's about to release a pointer
+// that has `read_pending` set. Returns true if the callback took ownership of
+// `ptr` (caller must NOT deallocate) — typical case: an active read pin was
+// found and the buffer was orphaned into the shard's PendingRead registry.
+// Returns false if no active pin was found (e.g. the registry entry was
+// already drained); caller proceeds with a normal deallocate.
+using LargeStringOrphanFn = bool (*)(void* ptr);
+
+// Registers (or unregisters with nullptr) the orphan callback on the current
+// thread. Must be set during shard startup before any zero-copy reads can
+// pin a LargeString on this thread.
+void SetLargeStringOrphanCallback(LargeStringOrphanFn fn);
 
 }  // namespace detail
 
@@ -244,6 +270,16 @@ class CompactObj {
   // that lifetime — see facade::SinkReplyBuilder::ReplyScope for the reply
   // builder's contract.
   std::optional<std::string_view> TryGetRawView() const;
+
+  // Mark the underlying LargeString as having at least one outstanding read
+  // pin (Copy-on-Write hook). When a mutation runs on a read-pending value,
+  // LargeString hands the prior buffer off to the registered orphan callback
+  // instead of deallocating it inline. Idempotent.
+  //
+  // Const because the bit is bookkeeping metadata about outstanding readers;
+  // it does not change the logical value. Only valid to call when the value
+  // is currently LARGE_STR_TAG (i.e. TryGetRawView would succeed).
+  void MarkReadPending() const;
 
   std::string ToString() const {
     std::string res;
