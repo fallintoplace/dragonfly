@@ -332,9 +332,13 @@ pinned values.
 
 A pin allocated on shard A but unpinned by a different IO thread
 arrives back at A's MPSC free list. The actual `deallocate` runs in
-A's `DrainPendingReads`, using A's mimalloc heap. mimalloc supports
-cross-thread free, but routing it back to the owning heap avoids the
-slow path and cross-thread accounting overhead.
+A's `DrainPendingReads` via `CompactObj::memory_resource()->deallocate(...)`
+— the same thread-local MR that `LargeString::Free` uses. Because the
+drain runs on shard A's thread, the call dispatches to A's
+`MiMemoryResource` and hits the buffer's owning mimalloc heap. The
+`PendingRead` entry itself is freed with a plain `delete` from the
+same thread it was `new`'d on, so its allocation and free both live
+on A's heap as well.
 
 ### Capture / replay window
 

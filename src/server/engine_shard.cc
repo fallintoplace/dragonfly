@@ -494,7 +494,7 @@ void EngineShard::Shutdown() {
   DrainPendingReads();
   for (auto& [ptr, pin] : pending_read_map_) {
     if (pin->orphaned)
-      mi_resource_.deallocate(pin->ptr, 0, 8);
+      CompactObj::memory_resource()->deallocate(pin->ptr, 0, 8);
     delete pin;
   }
   pending_read_map_.clear();
@@ -557,9 +557,11 @@ void EngineShard::DrainPendingReads() {
       continue;
     }
     if (pin->orphaned) {
-      // The CompactObj has moved on; this entry owns the buffer. Free on
-      // our heap (we are the owning shard).
-      mi_resource_.deallocate(pin->ptr, 0, 8);
+      // The CompactObj has moved on; this entry owns the buffer. Free via
+      // the thread-local MR (same path as LargeString::Free) — we are
+      // running on the owning shard's thread, so the deallocate hits the
+      // buffer's owning mimalloc heap.
+      CompactObj::memory_resource()->deallocate(pin->ptr, 0, 8);
     } else {
       // Still attached to a live CompactObj (no mutation happened during
       // the read window). Drop the map entry so future pins create a fresh
