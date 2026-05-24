@@ -1,468 +1,369 @@
 # Zero-Copy GET for Large Strings
 
-This document describes the zero-copy `GET` path for large string values in
-Dragonfly. The feature lands in two stages: an MVP that's safe under read-only
-traffic and a Copy-on-Write (CoW) extension that makes it safe under arbitrary
-concurrent mutations.
+A `GET` on a large string value in Dragonfly transports the user-visible
+bytes from the shard's `CompactObj` storage to the client socket without
+materializing the string anywhere in between. The shard does not allocate
+a `std::string`; the reply builder does not buffer the full payload; the
+encoded representation (if any) is decoded one chunk at a time directly
+into the reply builder's existing scratch buffer.
 
-## Motivation
+The borrowed pointer survives concurrent mutations of the same key via a
+Copy-on-Write mechanism: a writer that races a reader installs a fresh
+allocation on the `CompactObj` and leaves the old buffer owned by a
+refcount-bearing pin, which is freed on the buffer's owning shard once
+the last reader is done with it.
 
-A `GET` on a value ≥1 KiB does ~2 transient copies between storage and the
-socket:
+## What's covered
 
-1. **Shard-side allocation.** `ReadString` calls `pv.ToString()` which
-   `malloc`s a `std::string` and `memcpy`s the value into it
-   (`src/server/string_family.cc`, `CompactObj::ToString` →
-   `CompactObj::GetString(string*)`).
-2. **Reply-builder copy** (small replies only). For replies <4 KiB,
-   `SinkReplyBuilder::FinishScope` may copy refs into its 8 KiB buffer so the
-   source can die before the actual socket write. For replies ≥4 KiB,
-   `FinishScope` early-flushes — no copy here.
+- `LARGE_STR_TAG` values (heap-allocated, > ~256 bytes after the small
+  string carve-out).
+- Encodings `NONE_ENC`, `ASCII1_ENC`, `ASCII2_ENC`. Huffman-encoded
+  values use the materializing path (variable-length codes don't chunk
+  trivially).
+- All in-memory accesses. `EXTERNAL_TAG` (tiered) values require an
+  asynchronous disk fetch and remain outside the zero-copy story.
 
-Step 2 is already zero-copy for the size class we care about; the real waste
-is step 1. Eliminating it requires teaching the GET handler to pass a
-borrowed `string_view` directly into the shard's `CompactObj` storage to the
-reply builder, *and* ensuring the underlying bytes outlive any potential
-fiber yield during the socket write.
+`GET` is the only command that uses this path. Mutating reads
+(`GETDEL`, `GETEX`, `GETSET`) and multi-key reads (`MGET`) keep the
+materializing `pv.ToString()` path.
 
-## Background — relevant components
+## Threading model
+
+Dragonfly's shared-nothing design pins each shard to a single proactor
+thread with a thread-local mimalloc heap. A connection is bound to one
+proactor; `GET` for a foreign key hops to the owning shard via
+`SingleHopT(cb)`, then resumes on the connection's proactor for reply
+construction. The socket write itself is synchronous (`writev`) but may
+yield the fiber while waiting on the kernel — other commands on the
+same shard can run during that window. Cross-thread free is supported
+by mimalloc but slow; the design routes all deallocations back to the
+buffer's owning shard.
+
+## Building blocks
 
 ### `detail::LargeString`
 
-Storage for raw non-inline string values in `CompactObj`. Packed 16 bytes:
+The 16-byte storage for non-inline raw strings in `CompactObj`:
 
-```
+```cpp
 struct LargeString {
-  void* ptr;            // mimalloc allocation
-  uint64_t sz : 56;     // current length
-  uint64_t read_pending : 1;  // CoW hook (see below)
+  void* ptr;                   // mimalloc allocation on owning shard
+  uint64_t sz : 56;            // current length in bytes
+  uint64_t read_pending : 1;   // at least one outstanding read pin
   uint64_t reserved : 7;
 };
 ```
 
-Only `LARGE_STR_TAG` CompactObj values use `LargeString`. Smaller / encoded
-/ inline strings live in different union members.
+`read_pending` is set when one or more readers hold a borrowed view
+into `ptr`. While the bit is set, `LargeString::SetString` and
+`LargeString::Free` do not deallocate `ptr` directly; they invoke a
+thread-local orphan callback that hands ownership of the buffer over to
+the per-shard pending-read registry.
 
-### `SinkReplyBuilder`
+`LargeString::DefragIfNeeded` returns false (no defrag) while
+`read_pending` is set — a reallocation would invalidate outstanding
+borrowed views.
 
-Per-connection, lives on the connection's IO/proactor thread. Accumulates
-`iovec`s via `WritePieces` (copy-into-buffer) or `WriteRef` (push pointer
-only). `Send()` does a synchronous `writev` on the socket and returns when
-the bytes are in the kernel. `ReplyScope` is the explicit lifetime guard:
-within a scope, callers promise that `WriteRef`'d views remain valid until
-`FinishScope` runs.
+`LargeString::AppendString` mutates in place and would corrupt pinned
+readers; it `DCHECK`s `!IsReadPending()`. The only caller is
+`rdb_load`, which never produces values that have been pinned.
 
-### Threading model
+### `CompactObj::TryGetRaw`
 
-Dragonfly is shared-nothing. Each shard owns a fiber-friendly proactor
-thread (its mimalloc heap is thread-local). A connection is bound to one
-proactor. Commands hop from the connection's proactor to the key's shard
-via `SingleHopT(cb)`. After `cb` returns, control resumes on the
-connection's proactor for reply construction.
+Returns a borrowed view of the underlying `LargeString` along with the
+metadata needed to decode it:
 
-For a `GET` on a same-thread key, the cb and reply run on the same thread.
-For a cross-shard `GET`, the shard reads the value and returns a result;
-the connection's proactor consumes it. Either way the borrowed pointer
-may need to outlive a fiber yield (the socket `writev` can suspend).
+```cpp
+struct RawBorrow {
+  std::string_view encoded;   // bytes as stored
+  size_t decoded_size;        // user-visible byte count
+  uint8_t encoding;           // NONE / ASCII1 / ASCII2
+};
+std::optional<RawBorrow> CompactObj::TryGetRaw() const;
+```
 
-## Stage 1 — MVP (read-only safe)
+For `NONE_ENC` the view is the user-visible bytes
+(`encoded.size() == decoded_size`). For `ASCII1`/`ASCII2` the view is
+the packed source and `decoded_size` is computed from the packed
+length and the first byte via the existing `StrEncoding::DecodedSize`.
 
-### What it changes
+`CompactObj::MarkReadPending() const` stamps the bit on the underlying
+`LargeString` (via a controlled `const_cast` — the bit is
+bookkeeping metadata, not part of the logical value).
 
-- New `CompactObj::TryGetRaw() const → optional<RawBorrow>` —
-  returns a borrowed view into `u_.large_str.AsView()` iff
-  `taglen_==LARGE_STR_TAG && !IsExternal()`. In the MVP this is gated
-  to `encoding_==NONE_ENC`; Stage 3 extends it to ASCII1/ASCII2.
-- New `BorrowedString` strong-typed variant alternative in
-  `StringResult` (`encoded` view + `pin` + `encoding` + `decoded_size`).
-- New `ReadStringBorrow` helper: tries `TryGetRaw`, falls back to
-  `ReadString` (owned `std::string`) otherwise.
-- `CmdGet` uses `ReadStringBorrow`. Other readers (`GETDEL`, `GETEX`,
-  `GETSET`) keep `ReadString` because they mutate or remove the key.
-- New `SendBulkStringBorrowed(view)` on the reply builder — same as
-  `SendBulkString` for the default sink, but `CapturingReplyBuilder`
-  (used by the squashing / `MULTI`-`EXEC` path) overrides it to preserve
-  the borrowed view instead of materializing a `std::string` copy. This
-  is critical for pipelined / `EXEC` workloads — without it the captured
-  payload would defeat zero-copy.
-
-### Why it's read-only
-
-Between `SendBulkStringBorrowed(view)` and the socket-write completion,
-the borrowed pointer must remain valid. The shard's fiber may yield
-during `Send`'s `writev`, allowing other fibers (different connection's
-commands on the same shard) to run. Under read-only traffic none of
-them frees the buffer; with mutations any of:
-
-- `SET` overwrite — `LargeString::SetString` deallocates the prior buffer
-  inline.
-- `APPEND` / `SETRANGE` — `ExtendExisting` reads + `SetString`.
-- `DEL` / TTL expiry / eviction — `PerformDeletionAtomic`.
-- Defrag — `LargeString::DefragIfNeeded` reallocates in place.
-
-…would invalidate the pointer.
-
-The MVP ships behind a startup flag `--get_zero_copy` (cached
-thread-locally in `ReadStringBorrow`, no per-GET overhead). Two INFO
-counters expose engagement: `borrowed_string_views_total` (shard-side
-decision) and `borrowed_strings_sent_total` (reply-side, including
-capture/replay through squashing).
-
-## Stage 2 — Copy-on-Write
-
-CoW lifts the read-only restriction. Three ingredients:
-
-1. **A `read_pending` bit on `LargeString`.** Set when at least one reader
-   is borrowing `ptr`.
-2. **A per-shard pin registry.** Maps active buffer pointers to a
-   refcount-bearing `PendingRead` entry.
-3. **Mutation interception** in `LargeString::SetString` /
-   `LargeString::Free`. When `read_pending=1`, the writer *orphans* the
-   buffer (transfers ownership to the registry) instead of deallocating
-   it inline. The `CompactObj` installs a fresh allocation in place.
-
-When the last reader unpins, the orphaned buffer is reclaimed on the
-owning shard's heap (mimalloc requires cross-thread free to run on the
-owning heap).
-
-### `PendingRead`
+### `PendingRead` and the per-shard registry
 
 ```cpp
 struct PendingRead {
   void* ptr;                            // buffer being tracked
   std::atomic<uint32_t> refcnt;         // active reader count
-  bool orphaned;                        // writer detached it from CompactObj
+  bool orphaned;                        // writer detached from CompactObj
   EngineShard* owner_shard;             // for cross-thread routing
   std::atomic<PendingRead*> mpsc_next;  // intrusive next for MPSC free list
 };
-```
 
-`PendingRead` is allocated by `EngineShard::PinRead` and lives until the
-shard drains it (refcnt==0 + processed). It's *not* allocated from the
-shard's `MiMemoryResource` — `new`/`delete` is fine since it's a small
-fixed-size struct and we want cross-thread visibility of the metadata.
-
-### Per-shard registry
-
-```cpp
 class EngineShard {
-  // Active pins. Only touched on this shard's thread.
+  // Active pins. Single-threaded — only this shard touches it.
   absl::flat_hash_map<void*, PendingRead*> pending_read_map_;
 
-  // PendingRead entries whose refcnt reached zero on a remote thread,
-  // waiting for cleanup on this shard.
+  // Entries whose refcnt reached zero on a remote thread, awaiting
+  // cleanup on this shard. Multi-producer / single-consumer.
   base::MPSCIntrusiveQueue<PendingRead> pending_read_free_list_;
 };
 ```
 
-`pending_read_map_` is single-threaded (shard-only). Producers of
-`pending_read_free_list_` are any IO threads via `UnpinRead`; consumer
-is this shard via `DrainPendingReads`.
+The map is private to the shard thread. The free list takes entries
+from any thread (typically IO threads dropping the last reference at
+the end of a socket write) and is drained by the owning shard from
+`Heartbeat()` and at `Shutdown`.
 
-### API
+Method surface:
 
-```cpp
-// On the shard thread, at borrow time.
-PendingRead* shard->PinRead(void* ptr);
+- `EngineShard::PinRead(ptr)` — shard thread. Finds or inserts an
+  entry, increments `refcnt`, returns `PendingRead*`.
+- `EngineShard::UnpinRead(pin)` — any thread, static. Decrements
+  `refcnt`; if it transitions to zero, pushes `pin` to its owner
+  shard's free list.
+- `EngineShard::OrphanLargeStringPtr(ptr)` — shard thread. Marks the
+  active entry orphaned and removes it from the map. Returns false if
+  no entry was found (in which case the caller deallocates normally).
+- `EngineShard::DrainPendingReads()` — shard thread. Pops entries from
+  the free list; re-checks `refcnt` with acquire ordering and skips
+  re-pinned entries; for orphaned entries frees the buffer on this
+  shard's heap; for non-orphaned entries removes the map slot. Deletes
+  the entry struct.
 
-// Sets the bit on the LargeString — must be paired with PinRead.
-pv.MarkReadPending();
+### Reply builder integration
 
-// Any thread, after the socket write completes.
-static void EngineShard::UnpinRead(PendingRead* pin);
+`SinkReplyBuilder` is per-connection, lives on the connection's
+proactor thread, and accumulates `iovec` entries via `WritePieces`
+(copy into scratch) or `WriteRef` (push pointer only). `Send()` does a
+synchronous `writev` and returns when the bytes are in the kernel.
 
-// Shard thread, from Heartbeat() and Shutdown().
-void shard->DrainPendingReads();
-
-// Shard thread, called by LargeString::SetString / Free via callback.
-bool shard->OrphanLargeStringPtr(void* ptr);
-```
-
-### LargeString hook
-
-`compact_object.cc` declares a thread-local function pointer:
-
-```cpp
-thread_local LargeStringOrphanFn on_large_str_orphan;
-```
-
-`EngineShard::InitThreadLocal` installs a callback that forwards to
-`OrphanLargeStringPtr` on the current shard. A common helper
-`ReleasePtr` is invoked by `LargeString::SetString` and `LargeString::Free`:
-
-```cpp
-static void ReleasePtr(LargeString* ls, MemoryResource* mr) {
-  if (ls->ptr == nullptr) {
-    ls->SetReadPending(false);
-    return;
-  }
-  bool orphaned = false;
-  if (ls->IsReadPending() && on_large_str_orphan != nullptr)
-    orphaned = on_large_str_orphan(ls->ptr);
-  if (!orphaned)
-    mr->deallocate(ls->ptr, 0, kAlignSize);
-  ls->ptr = nullptr;
-  ls->SetReadPending(false);
-}
-```
-
-`SetString` triggers `ReleasePtr` when either the new value doesn't fit in
-the existing buffer **or** `read_pending=1` (in-place overwrite of a buffer
-visible to a reader would corrupt their bytes).
-
-### Reply-builder integration
-
-`SinkReplyBuilder` grows two members:
+The borrow path needs the source bytes to outlive the socket write
+(which may suspend the fiber). `SinkReplyBuilder` carries a small list
+of opaque post-send pins:
 
 ```cpp
 absl::InlinedVector<void*, 4> post_send_pins_;
-static void SetPostSendUnpinFn(void (*fn)(void*));  // wired at server startup
 void AddPostSendPin(void* pin);
+static void SetPostSendUnpinFn(void (*fn)(void*));
 ```
 
-After `Send()`'s `writev` returns, the builder drains
-`post_send_pins_` through the installed function (forwards to
-`EngineShard::UnpinRead`).
+After `Send()`'s `writev` returns, each pin is passed to the
+process-wide unpin function (installed once at startup to forward to
+`EngineShard::UnpinRead`). The reply builder remains free of any
+dependency on `server/engine_shard.h` — the only seam is the function
+pointer.
 
-The reply builder is intentionally typed `void*` and pulls no
-`server/engine_shard.h` dependency — the function pointer is the only
-seam.
+`SinkReplyBuilder::WriteDecodedChunks(src, decoded_size, decode_fn,
+chunk_alignment)` streams a decoded payload directly into the scratch
+buffer. It loops: ensure the scratch has room for at least
+`chunk_alignment` bytes (Flush if not); decode the next chunk into the
+scratch's append region; extend the previous iovec or push a new one;
+advance. When the scratch fills, an intermediate `Flush()` drains it
+via `writev` and resets. One chunk's worth of decoded bytes lives in
+the scratch at any time; the full decoded payload is never held.
 
-### CmdGet flow
+`RedisReplyBuilderBase::SendBulkStringStreamed` wraps the `$N\r\n`
+framing around `WriteDecodedChunks` and the trailing `\r\n`.
+
+### Chunked ASCII decode
+
+ASCII packing maps every 8 decoded chars to 7 packed bytes; after the
+last full group, up to 7 unpacked bytes are stored verbatim.
+`ascii_unpack(bin, count, dest)` handles partial sub-ranges naturally
+as long as `count` is a multiple of 8 (or it's the final chunk
+covering the unaligned tail). `detail::ascii_unpack_chunk(src,
+dec_offset, count, dest)` codifies the encoded-offset math:
 
 ```cpp
-// shard thread, inside SingleHopT callback:
-if (auto raw = pv.TryGetRaw()) {
-  PendingRead* pin = es->PinRead(raw->encoded.data());
-  pv.MarkReadPending();
-  return BorrowedString{raw->encoded, pin, raw->decoded_size, raw->encoding};
+inline void ascii_unpack_chunk(const uint8_t* src, size_t dec_offset,
+                                size_t count, char* dest) {
+  ascii_unpack(src + (dec_offset / 8) * 7, count, dest);
 }
-
-// proactor thread, building the reply:
-if (bs.encoding == 0) {
-  rb->SendBulkStringBorrowed(bs.encoded);            // NONE_ENC: iovec ref
-} else {
-  rb->SendBulkStringStreamed(                        // ASCII: chunked decode
-      bs.encoded.data(), bs.decoded_size, ascii_unpack_thunk, /*align=*/8);
-}
-if (bs.pin)
-  rb->AddPostSendPin(bs.pin);                        // released after Send()'s writev
+inline constexpr size_t kAsciiChunkAlignment = 8;
 ```
 
-Order matters: `AddPostSendPin` runs **after** `SendBulkStringBorrowed`. The
-latter may internally `Flush` if it hits `IOV_MAX`; that internal `Send`
-drains `post_send_pins_`, so the new pin must be queued afterward to avoid
-early release.
+`SendBulkStringStreamed` is called with this function and the
+8-decoded-byte chunk alignment; intermediate chunks decode the maximum
+aligned amount that fits in the (8 KiB) scratch, and the final chunk
+picks up any unaligned tail.
 
-## End-to-end timeline
+### Capture / replay (squashing, MULTI/EXEC)
 
-```
-                    Shard A thread                           IO thread (conn X)
-                    --------------                           ------------------
-T0  GET k (cb)
-      pv = FindReadOnly(k)
-      raw = pv.TryGetRaw() // borrowed view + encoding + decoded_size
-      pin = PinRead(view.data())
-      pv.MarkReadPending()      // read_pending = 1
-      return BorrowedString{view, pin}
-                                  ─── SingleHopT result ──>
-T1                                                          rb->SendBulkStringBorrowed(view)
-                                                            rb->AddPostSendPin(pin)
-T2  (other commands run on A while X's reply is queued)     rb->Flush() → Send() → sink->Write(vecs)
-      e.g. SET k newval2:
-        LargeString::SetString(newval2)
-          read_pending == 1
-            on_large_str_orphan(ptr) → OrphanLargeStringPtr:
-              entry = pending_read_map_[ptr]
-              entry->orphaned = true
-              pending_read_map_.erase(ptr)
-              return true
-          allocate new buffer, install in CompactObj
-          read_pending = 0
-T3                                                          (Send returns; bytes in kernel)
-                                                            for p in post_send_pins_: unpin(p)
-                                                              UnpinRead(pin):
-                                                                fetch_sub(1) == 1
-                                                                push to A's pending_read_free_list_
-T4  Heartbeat:
-      DrainPendingReads()
-        pop entry, refcnt==0, orphaned=true
-        mi_resource_.deallocate(entry->ptr) // freed on A's heap
-        delete entry
-```
+`MultiCommandSquasher` runs commands against a
+`CapturingReplyBuilder` that records replies into intermediate
+payloads, then replays them to the real sink. Both the borrowed
+(NONE_ENC) and streamed (ASCII) paths must survive this boundary
+without copying.
 
-If no mutation happens between T0 and T3 (the read-only case the MVP
-targeted), at T4 the entry is `orphaned=false`: drain simply erases it
-from the map; the `CompactObj` continues to own the buffer.
-
-## Race conditions and safety
-
-### Drain vs. re-pin
-
-After `UnpinRead` pushes `entry` to `free_list_`, but before `DrainPendingReads`
-pops it, another reader on the same shard can call `PinRead(ptr)` and find
-the entry in the map with refcnt 0 → 1. When drain eventually pops, it
-re-loads refcnt with `acquire` ordering and skips entries with refcnt > 0.
-The new readers will themselves push to `free_list_` when they unpin.
-
-### Post-drain mutation
-
-The `LargeString::read_pending` bit can linger after the last reader has
-unpinned and `DrainPendingReads` has erased the map entry (for the
-non-orphaned case). If a writer mutates *after* that point, the orphan
-callback looks up `ptr` and doesn't find it. The callback returns `false`;
-`LargeString` falls through to a normal `mr->deallocate`. Correct, because
-no active reader has the pointer.
-
-### Defrag
-
-`LargeString::DefragIfNeeded` would reallocate the buffer and break any
-outstanding borrowed view. When `read_pending=1`, it returns `false` early
-without doing anything. The next defrag pass after the pin clears will pick
-up the same buffer.
-
-### AppendString
-
-`LargeString::AppendString` mutates the buffer in place — that would
-corrupt pinned readers. It DCHECKs `!IsReadPending()`. The only caller is
-`rdb_load`, which never produces values that have been pinned.
-
-### Cross-thread free
-
-Pin allocated on shard A but unpinned on a different IO thread X: when
-refcnt → 0 on X, the entry is pushed onto **A's** MPSC queue. The actual
-`mr->deallocate` runs in A's `DrainPendingReads`, on A's mimalloc heap.
-mimalloc supports cross-thread free, but routing it back to the owning
-heap avoids the slow path and the cross-thread accounting overhead.
-
-### Pipelining / `EXEC`
-
-`MultiCommandSquasher` uses `CapturingReplyBuilder` which records replies
-into intermediate payloads before flushing to the real sink. The
-`SendBulkStringBorrowed` override stores the borrowed view directly in the
-capture (no copy). The lifetime contract holds: pins added via
-`AddPostSendPin` are not released until the final `Send` writes the
-captured payload.
-
-## Stage 3 — Chunked ASCII decode at reply time
-
-The MVP and CoW stages cover `NONE_ENC` (raw) large strings. ASCII-packed
-values (`ASCII1_ENC`, `ASCII2_ENC`) historically required a full decoded
-buffer somewhere — either a `pv.ToString` allocation on the shard or a
-materialized decode in the reply builder. This stage extends zero-copy to
-ASCII by **chunk-decoding the packed source directly into the reply
-builder's existing scratch buffer**. No full decoded payload is held
-anywhere — only one chunk at a time lives in the scratch.
-
-### Why ASCII fits the chunked model
-
-ASCII packing maps every 8 decoded chars to 7 packed bytes; after the last
-full group, up to 7 bytes of unpacked tail are stored verbatim. Decoding
-any 8-aligned decoded sub-range `[O, O+N)` only needs the packed bytes at
-`[(O/8)*7, (O/8)*7 + N*7/8)`. The standard `ascii_unpack(bin, count, dest)`
-naturally handles partial sub-ranges as long as `count` is a multiple of 8
-(or it's the final chunk covering any unaligned tail). A thin wrapper
-`detail::ascii_unpack_chunk(src, dec_offset, count, dest)` in
-`core/detail/bitpacking.h` codifies this, with `detail::kAsciiChunkAlignment = 8`.
-
-### Reply-builder primitive
-
-`SinkReplyBuilder::WriteDecodedChunks` (protected) loops over chunks:
+`facade::payload::Payload` gains two alternatives:
 
 ```cpp
-while (written < decoded_size) {
-  size_t needed = min(remaining, chunk_alignment);
-  if (scratch.AppendLen() < needed || vecs_.size() >= IOV_MAX - 2)
-    Flush(needed);
+struct BulkStringView { std::string_view view; };
 
-  size_t this_chunk = min(scratch.AppendLen(), remaining);
-  if (this_chunk < remaining)
-    this_chunk -= this_chunk % chunk_alignment;   // align all but final
-
-  char* dest = scratch.AppendBuffer().data();
-  decode_fn(src, written, this_chunk, dest);     // decode in place
-  // extend last iovec or push new one (same pattern as WritePieces)
-  scratch.CommitWrite(this_chunk);
-  written += this_chunk;
-}
-```
-
-Intermediate chunks decode the maximum aligned amount that fits in scratch
-(typically up to `kMaxBufferSize = 8 KiB`); the final chunk handles
-whatever remains (possibly including the unaligned tail). When the scratch
-fills, `Flush()` drains it via `writev` and resets — yielding one syscall
-per ~8 KiB of decoded payload. For a 1 MiB decoded reply that's ~128
-`writev` calls; the alternative — a 1 MiB allocation and `memcpy` — costs
-~100 µs in pure copy time plus malloc overhead. The chunked path trades a
-bit of syscall overhead for zero allocation and constant memory footprint.
-
-`RedisReplyBuilderBase::SendBulkStringStreamed` is the public entry point:
-it writes the `$N\r\n` framing, calls `WriteDecodedChunks`, then writes
-the trailing `\r\n`. The `decode_fn` callback is supplied by the caller —
-keeps the reply builder ignorant of encoding specifics.
-
-### Borrow API extension
-
-`CompactObj::TryGetRaw()` returns:
-
-```cpp
-struct RawBorrow {
-  std::string_view encoded;
+struct BulkStringStreamed {
+  const void* src;
   size_t decoded_size;
-  uint8_t encoding;   // NONE_ENC / ASCII1_ENC / ASCII2_ENC
+  StreamingDecodeFn decode_fn;
+  size_t chunk_alignment;
 };
 ```
 
-For `NONE_ENC`: `encoded` is the user-visible bytes (`encoded.size() ==
-decoded_size`). For `ASCII1/2_ENC`: `encoded` is the packed source
-(`encoded.size() < decoded_size`); `decoded_size` is computed via
-`StrEncoding::DecodedSize(packed_size, first_byte)` which knows the
-ASCII1 vs ASCII2 rounding semantics.
+`BulkStringStreamed` is stored via `std::unique_ptr` so the variant
+alternative stays at 8 bytes (preserves `sizeof(Payload) == 40`).
+`CapturingReplyBuilder::SendBulkStringBorrowed` records the view
+directly; `SendBulkStringStreamed` records the descriptor. The
+`CaptureVisitor` replay path calls the corresponding method on the
+real sink — chunked decode happens at replay time, not at capture
+time. The encoded source's lifetime is the same `PendingRead` pin that
+the shard registered; both paths share the post-send unpin discipline.
 
-`BorrowedString` (the variant alternative in `StringResult`) gains
-`encoding` and `decoded_size`. `CmdGet`'s `Send(BorrowedString)`
-dispatches: NONE → `SendBulkStringBorrowed`; ASCII → `SendBulkStringStreamed`
-with an `ascii_unpack_chunk` thunk.
+The HTTP API visitor produces a single contiguous JSON-escaped string
+and materializes the streamed payload once at that layer; chunked
+decoding into JSON output isn't a meaningful win.
 
-### Capture/replay (squashing, MULTI/EXEC)
+## End-to-end path
 
-`reply_payload.h` gains a `BulkStringStreamed { src, decoded_size,
-decode_fn, chunk_alignment }` payload, stored via `unique_ptr` so the
-`Payload` variant alternative stays at 8 bytes (preserves `sizeof(Payload)`).
-`CapturingReplyBuilder::SendBulkStringStreamed` records this struct. The
-`CaptureVisitor` replay path calls `SendBulkStringStreamed` on the real
-sink — chunked decode survives end-to-end through the capture/replay
-boundary. Lifetime: the captured `src` pointer is the same one held by
-the `PendingRead` pin, so the encoded source survives across the replay
-window under the same CoW rules.
+```cpp
+// shard thread, GET callback
+if (auto raw = pv.TryGetRaw()) {                  // optional<RawBorrow>
+  PendingRead* pin = es->PinRead(raw->encoded.data());
+  pv.MarkReadPending();                            // sets read_pending bit
+  return BorrowedString{raw->encoded, pin,
+                        raw->decoded_size, raw->encoding};
+}
 
-The HTTP API's `CaptureVisitor` handles the new variant differently — it
-needs one contiguous string to JSON-escape, so it materializes a single
-allocation there. Chunked decoding is an optimization for the socket sink;
-on the HTTP path it's not worth the implementation complexity.
+// proactor thread, GetReplies::Send(BorrowedString)
+if (bs.encoding == 0) {
+  rb->SendBulkStringBorrowed(bs.encoded);          // iovec ref (no copy)
+} else {
+  rb->SendBulkStringStreamed(bs.encoded.data(), bs.decoded_size,
+                             ascii_unpack_chunk_thunk,
+                             detail::kAsciiChunkAlignment);
+}
+rb->AddPostSendPin(bs.pin);                        // released after Send()
+```
+
+`AddPostSendPin` runs after the bulk-string send call because the
+latter may internally `Flush` on `IOV_MAX`, which drains existing
+post-send pins. Queuing the new pin afterward ensures it is not
+released before the bytes it protects hit the socket.
+
+## Concurrency picture
+
+```
+                    Shard A                                  Connection X (proactor)
+                    -------                                  -----------------------
+ GET k callback
+   raw = pv.TryGetRaw()
+   pin = PinRead(raw.encoded.data())  // inserts into A's map
+   pv.MarkReadPending()
+   return BorrowedString{...}
+                                  ─── SingleHopT result ──>
+                                                            rb->SendBulkStringStreamed(...)
+                                                              | streams decode into scratch
+                                                              | (or SendBulkStringBorrowed
+                                                              |  for NONE_ENC)
+                                                            rb->AddPostSendPin(pin)
+
+ (meanwhile, some other connection)
+ SET k newval (also on shard A)
+   LargeString::SetString sees read_pending=1
+     -> orphan callback runs on A
+       -> entry.orphaned = true
+       -> A's pending_read_map_.erase(old_ptr)
+   allocate new buffer, install in CompactObj
+   read_pending = 0
+                                                            rb->Flush() -> Send() -> sink->Write(vecs)
+                                                            // bytes in kernel
+                                                            for p in post_send_pins_:
+                                                              UnpinRead(p) -> fetch_sub(1)
+                                                              == 1 -> push to A's free_list_
+
+ Heartbeat
+   DrainPendingReads()
+     pop entry, refcnt==0, orphaned
+     mi_resource_.deallocate(old_ptr)   // freed on A's heap
+     delete entry
+```
+
+If no mutation occurs between borrow and unpin, the drain sees the
+entry as not-orphaned and just removes the map slot; the `CompactObj`
+continues to own the buffer through its normal lifecycle.
+
+## Race conditions and safety
+
+### Drain vs re-pin
+
+After `UnpinRead` pushes an entry whose `refcnt` reached zero, another
+reader on the same shard can `PinRead` the same `ptr` and observe the
+entry in the map with `refcnt` 0 → 1. When the drain finally pops the
+entry, it re-loads `refcnt` with acquire ordering and skips entries
+with `refcnt > 0`. The new readers will themselves push to the free
+list when they unpin. The map slot continues to point at the same
+entry; no double-free or leak.
+
+### Post-drain mutation
+
+The `LargeString::read_pending` bit can outlive the corresponding map
+entry — after the last reader unpins and the drain has removed the
+non-orphaned entry, the bit remains set on the `CompactObj`'s
+`LargeString`. A subsequent mutation invokes the orphan callback,
+which fails to find the `ptr` in the map and returns false. The
+`LargeString` then deallocates the buffer normally. Correct, because
+no active reader holds the pointer at that point.
+
+### Defrag
+
+The defrag task would reallocate a `LargeString` buffer in place and
+invalidate any outstanding borrowed views. `DefragIfNeeded` returns
+false (no defrag) when `read_pending=1`. Once the pins clear, the
+next defrag pass picks up the same value.
+
+### AppendString
+
+In-place mutation is forbidden while a pin is active; `AppendString`
+`DCHECK`s the bit. Today's only caller (`rdb_load`) never produces
+pinned values.
+
+### Cross-thread free
+
+A pin allocated on shard A but unpinned by a different IO thread
+arrives back at A's MPSC free list. The actual `deallocate` runs in
+A's `DrainPendingReads`, using A's mimalloc heap. mimalloc supports
+cross-thread free, but routing it back to the owning heap avoids the
+slow path and cross-thread accounting overhead.
+
+### Capture / replay window
+
+Captured payloads (`BulkStringView`, `BulkStringStreamed`) hold raw
+pointers into the borrowed source. The source's lifetime is governed
+by the same `PendingRead` pin that the originating `CmdGet` queued via
+`AddPostSendPin`. The final replay sink's `Send` releases the pin only
+after `writev` returns, so captured payloads remain valid through the
+entire squashing / `MULTI`-`EXEC` pipeline.
 
 ## What's out of scope
 
-- **MGET.** Today `CollectKeys` allocates a per-shard storage buffer
-  (`make_unique<char[]>`) and packs values into it. Zero-copy MGET would
-  require restructuring this path to carry borrowed views per result.
-  Future work.
+- **MGET.** `CollectKeys` today allocates a per-shard storage buffer
+  and packs values into it. Zero-copy MGET would carry borrowed views
+  per result instead.
 - **Huffman-encoded large strings.** `TryGetRaw` returns `nullopt` for
-  `HUFFMAN_ENC`; these keep the existing `pv.ToString` path. Adding
-  chunked Huffman would require a stateful streaming decoder
-  (Huffman codes are variable-length so chunk boundaries aren't fixed
-  on the encoded side); not done here.
-- **Tiered (`EXTERNAL_TAG`) values.** Require an asynchronous disk
-  fetch and live materialization; outside the zero-copy story.
-- **`SMALL_TAG` (<256 B) values.** Already cheap to copy; the
-  `LARGE_STR_TAG` boundary is the practical cutoff.
+  `HUFFMAN_ENC`. Chunked Huffman would require a stateful streaming
+  decoder; Huffman codes are variable-length so chunk boundaries
+  aren't fixed on the encoded side.
+- **`EXTERNAL_TAG` (tiered) values.** Asynchronous disk fetch and
+  materialization; outside the in-memory zero-copy story.
+- **`SMALL_TAG` and inline values.** Already cheap to copy.
 
 ## Tag / flag / counter reference
 
 | Symbol | Where | Meaning |
 |---|---|---|
 | `LARGE_STR_TAG` | `CompactObj::TagEnum` | Heap-allocated raw large string |
-| `NONE_ENC` | `CompactObj::EncodingEnum` | Stored bytes are the raw value |
+| `NONE_ENC` / `ASCII1_ENC` / `ASCII2_ENC` | `CompactObj::EncodingEnum` | Storage encoding |
 | `read_pending` | `detail::LargeString` | One or more readers may be borrowing `ptr` |
 | `--get_zero_copy` | `string_family.cc` flag | Master toggle for the borrow path |
 | `borrowed_string_views_total` | `EngineShard::Stats` | Shard-side: borrow decisions taken |
@@ -475,7 +376,7 @@ on the HTTP path it's not worth the implementation complexity.
 | `read_pending` bit, `TryGetRaw`, orphan hook | `src/core/compact_object.{h,cc}` |
 | Chunked ASCII decode primitive | `src/core/detail/bitpacking.h` |
 | Per-shard pin registry + MPSC drain | `src/server/engine_shard.{h,cc}` |
-| Reply builder pin release + `WriteDecodedChunks` + `SendBulkStringStreamed` | `src/facade/reply_builder.{h,cc}` |
+| Reply builder pin release, `WriteDecodedChunks`, `SendBulkStringStreamed` | `src/facade/reply_builder.{h,cc}` |
 | Capture/replay overrides (borrowed + streamed) | `src/facade/reply_capture.{h,cc}`, `src/facade/reply_payload.h` |
 | GET fast path (borrow + pin + dispatch) | `src/server/string_family.cc` |
 | HTTP-API visitor materialization | `src/server/http_api.cc` |
