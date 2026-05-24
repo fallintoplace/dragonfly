@@ -28,13 +28,32 @@ struct BulkString : public std::string {};    // SendBulkString
 // (e.g., a CompactObj raw payload) and must remain valid until the captured
 // reply is applied to the sink. Used by SendBulkStringBorrowed to preserve
 // zero-copy through the squashing capture/replay boundary. Same read-only
-// lifetime contract as CompactObj::TryGetRawView().
+// lifetime contract as CompactObj::TryGetRaw().
 struct BulkStringView {
   std::string_view view;
 };
 
+// Function pointer signature for a streaming decoder. Must match
+// SinkReplyBuilder::StreamingDecodeFn — kept here to avoid pulling
+// reply_builder.h into reply_payload.h.
+using StreamingDecodeFn = void (*)(const void* src, size_t dec_offset, size_t count, char* dest);
+
+// Captured streamed bulk string. The encoded source `src` is borrowed
+// (lifetime managed by the same pin discipline as BulkStringView). On
+// replay, the visitor calls SinkReplyBuilder::SendBulkStringStreamed which
+// chunk-decodes directly into the real sink's scratch — no full decoded
+// buffer is held anywhere. Stored via unique_ptr to keep the Payload
+// variant alternative at 8 bytes (preserves sizeof(Payload)).
+struct BulkStringStreamed {
+  const void* src;
+  size_t decoded_size;
+  StreamingDecodeFn decode_fn;
+  size_t chunk_alignment;
+};
+
 using Payload = std::variant<std::monostate, Null, Error, long, double, SimpleString, BulkString,
-                             BulkStringView, std::unique_ptr<CollectionPayload>>;
+                             BulkStringView, std::unique_ptr<BulkStringStreamed>,
+                             std::unique_ptr<CollectionPayload>>;
 
 #if defined(__linux__) && !defined(_LIBCPP_VERSION)
 static_assert(sizeof(Payload) == 40);

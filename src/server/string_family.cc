@@ -15,6 +15,7 @@
 #include "base/flags.h"
 #include "base/logging.h"
 #include "base/stl_util.h"
+#include "core/detail/bitpacking.h"
 #include "core/overloaded.h"
 #include "facade/cmd_arg_parser.h"
 #include "facade/op_status.h"
@@ -72,9 +73,17 @@ template <typename T> using TResultOrT = variant<T, TieredStorage::TResult<T>>;
 // time. The reply path hands it off to SinkReplyBuilder::AddPostSendPin so
 // it's released after the socket write completes. Null when the borrow path
 // is not engaged (e.g. fallback to an owned std::string).
+//
+// `encoding` and `decoded_size` carry the metadata needed by the reply
+// path to chunk-decode an ASCII-packed payload directly into the reply
+// builder's scratch — no full decoded buffer is ever held. For NONE_ENC,
+// `encoded` already holds the user-visible bytes and `decoded_size` is 0
+// (caller treats it as `encoded.size()`).
 struct BorrowedString {
-  std::string_view view;
+  std::string_view encoded;
   PendingRead* pin = nullptr;
+  size_t decoded_size = 0;  // 0 means "same as encoded.size()" (NONE_ENC)
+  uint8_t encoding = 0;     // NONE_ENC == 0; ASCII1_ENC == 1; ASCII2_ENC == 2
 };
 
 // StringResult adds a borrowed-view alternative on top of the generic
@@ -91,10 +100,15 @@ StringResult ReadString(DbIndex dbid, string_view key, const PrimeValue& pv, Eng
 }
 
 // Read-only fast path for GET: returns a borrowed view directly into the
-// shard's CompactObj storage when the value is a raw (NONE_ENC) large string;
-// otherwise falls back to the materializing ReadString. The borrowed view
-// remains valid only as long as the underlying storage is not mutated,
-// freed, or relocated — see CompactObj::TryGetRawView and the
+// shard's CompactObj storage when the value is a raw (NONE_ENC) or ASCII-
+// packed (ASCII1_ENC / ASCII2_ENC) large string; otherwise falls back to
+// the materializing ReadString.
+//
+// For NONE_ENC: caller streams the bytes directly.
+// For ASCII1/2_ENC: caller's reply path decodes chunk-by-chunk into its own
+// scratch (no full decoded buffer is ever held). Either way the borrowed
+// bytes remain valid only as long as the underlying storage is not mutated,
+// freed, or relocated — see CompactObj::TryGetRaw and the
 // facade::SinkReplyBuilder::ReplyScope contract.
 StringResult ReadStringBorrow(DbIndex dbid, string_view key, const PrimeValue& pv,
                               EngineShard* es) {
@@ -103,16 +117,22 @@ StringResult ReadStringBorrow(DbIndex dbid, string_view key, const PrimeValue& p
   // requires a restart, which is fine for A/B benchmarking.
   static thread_local bool zero_copy_enabled = absl::GetFlag(FLAGS_get_zero_copy);
   if (zero_copy_enabled && !pv.IsExternal()) {
-    if (auto view = pv.TryGetRawView()) {
+    if (auto raw = pv.TryGetRaw()) {
       ++es->stats().borrowed_string_views_total;
       // Register a read pin on this shard. The pin keeps the buffer alive
       // even if a concurrent mutation (SET/APPEND/DEL/expiry) runs on the
       // same key before the reply is flushed — the writer will orphan the
       // buffer instead of freeing it, and the owning shard reclaims it
       // when the last reader unpins.
-      PendingRead* pin = es->PinRead(const_cast<void*>(static_cast<const void*>(view->data())));
+      PendingRead* pin =
+          es->PinRead(const_cast<void*>(static_cast<const void*>(raw->encoded.data())));
       pv.MarkReadPending();
-      return StringResult{BorrowedString{*view, pin}};
+      return StringResult{BorrowedString{
+          .encoded = raw->encoded,
+          .pin = pin,
+          .decoded_size = (raw->encoding == 0) ? size_t{0} : raw->decoded_size,
+          .encoding = raw->encoding,
+      }};
     }
   }
   return ReadString(dbid, key, pv, es);
@@ -747,12 +767,24 @@ struct GetReplies {
       // std::string and defeats the MVP on pipelined workloads.
       ++ServerState::tlocal()->stats.borrowed_strings_sent_total;
       auto& bs = get<BorrowedString>(res);
-      rb->SendBulkStringBorrowed(bs.view);
+      if (bs.encoding == 0) {
+        // NONE_ENC: write the borrowed bytes directly via WriteRef.
+        rb->SendBulkStringBorrowed(bs.encoded);
+      } else {
+        // ASCII1_ENC / ASCII2_ENC: stream-decode in chunks straight into the
+        // reply builder's scratch. The packed source stays borrowed; only
+        // one chunk's worth of decoded bytes lives in the scratch at a time.
+        auto ascii_decode = +[](const void* src, size_t dec_offset, size_t count, char* dest) {
+          detail::ascii_unpack_chunk(static_cast<const uint8_t*>(src), dec_offset, count, dest);
+        };
+        rb->SendBulkStringStreamed(bs.encoded.data(), bs.decoded_size, ascii_decode,
+                                   detail::kAsciiChunkAlignment);
+      }
       // Register the pin so it's released after the socket write completes.
-      // Order matters: register AFTER SendBulkStringBorrowed so any internal
+      // Order matters: register AFTER the bulk-string send so any internal
       // Flush triggered by IOV_MAX (which drains existing post-send pins)
       // happens before our pin is added — otherwise we could unpin before
-      // the view's bytes hit the socket.
+      // the bytes hit the socket.
       if (bs.pin)
         rb->AddPostSendPin(bs.pin);
       return;

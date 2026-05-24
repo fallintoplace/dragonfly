@@ -69,11 +69,13 @@ may need to outlive a fiber yield (the socket `writev` can suspend).
 
 ### What it changes
 
-- New `CompactObj::TryGetRawView() const → optional<string_view>` —
-  returns `u_.large_str.AsView()` iff `taglen_==LARGE_STR_TAG && encoding_==NONE_ENC && !IsExternal()`. Nullopt otherwise.
-- New `BorrowedString { string_view view; }` strong-typed variant
-  alternative in `StringResult`.
-- New `ReadStringBorrow` helper: tries `TryGetRawView`, falls back to
+- New `CompactObj::TryGetRaw() const → optional<RawBorrow>` —
+  returns a borrowed view into `u_.large_str.AsView()` iff
+  `taglen_==LARGE_STR_TAG && !IsExternal()`. In the MVP this is gated
+  to `encoding_==NONE_ENC`; Stage 3 extends it to ASCII1/ASCII2.
+- New `BorrowedString` strong-typed variant alternative in
+  `StringResult` (`encoded` view + `pin` + `encoding` + `decoded_size`).
+- New `ReadStringBorrow` helper: tries `TryGetRaw`, falls back to
   `ReadString` (owned `std::string`) otherwise.
 - `CmdGet` uses `ReadStringBorrow`. Other readers (`GETDEL`, `GETEX`,
   `GETSET`) keep `ReadString` because they mutate or remove the key.
@@ -230,16 +232,21 @@ seam.
 
 ```cpp
 // shard thread, inside SingleHopT callback:
-if (auto view = pv.TryGetRawView()) {
-  PendingRead* pin = es->PinRead(view->data());
+if (auto raw = pv.TryGetRaw()) {
+  PendingRead* pin = es->PinRead(raw->encoded.data());
   pv.MarkReadPending();
-  return BorrowedString{*view, pin};
+  return BorrowedString{raw->encoded, pin, raw->decoded_size, raw->encoding};
 }
 
 // proactor thread, building the reply:
-rb->SendBulkStringBorrowed(bs.view);   // pushes iovec ref
+if (bs.encoding == 0) {
+  rb->SendBulkStringBorrowed(bs.encoded);            // NONE_ENC: iovec ref
+} else {
+  rb->SendBulkStringStreamed(                        // ASCII: chunked decode
+      bs.encoded.data(), bs.decoded_size, ascii_unpack_thunk, /*align=*/8);
+}
 if (bs.pin)
-  rb->AddPostSendPin(bs.pin);           // released after Send()'s writev
+  rb->AddPostSendPin(bs.pin);                        // released after Send()'s writev
 ```
 
 Order matters: `AddPostSendPin` runs **after** `SendBulkStringBorrowed`. The
@@ -254,7 +261,7 @@ early release.
                     --------------                           ------------------
 T0  GET k (cb)
       pv = FindReadOnly(k)
-      view = pv.TryGetRawView() // points into u_.large_str.ptr
+      raw = pv.TryGetRaw() // borrowed view + encoding + decoded_size
       pin = PinRead(view.data())
       pv.MarkReadPending()      // read_pending = 1
       return BorrowedString{view, pin}
@@ -337,15 +344,114 @@ capture (no copy). The lifetime contract holds: pins added via
 `AddPostSendPin` are not released until the final `Send` writes the
 captured payload.
 
+## Stage 3 — Chunked ASCII decode at reply time
+
+The MVP and CoW stages cover `NONE_ENC` (raw) large strings. ASCII-packed
+values (`ASCII1_ENC`, `ASCII2_ENC`) historically required a full decoded
+buffer somewhere — either a `pv.ToString` allocation on the shard or a
+materialized decode in the reply builder. This stage extends zero-copy to
+ASCII by **chunk-decoding the packed source directly into the reply
+builder's existing scratch buffer**. No full decoded payload is held
+anywhere — only one chunk at a time lives in the scratch.
+
+### Why ASCII fits the chunked model
+
+ASCII packing maps every 8 decoded chars to 7 packed bytes; after the last
+full group, up to 7 bytes of unpacked tail are stored verbatim. Decoding
+any 8-aligned decoded sub-range `[O, O+N)` only needs the packed bytes at
+`[(O/8)*7, (O/8)*7 + N*7/8)`. The standard `ascii_unpack(bin, count, dest)`
+naturally handles partial sub-ranges as long as `count` is a multiple of 8
+(or it's the final chunk covering any unaligned tail). A thin wrapper
+`detail::ascii_unpack_chunk(src, dec_offset, count, dest)` in
+`core/detail/bitpacking.h` codifies this, with `detail::kAsciiChunkAlignment = 8`.
+
+### Reply-builder primitive
+
+`SinkReplyBuilder::WriteDecodedChunks` (protected) loops over chunks:
+
+```cpp
+while (written < decoded_size) {
+  size_t needed = min(remaining, chunk_alignment);
+  if (scratch.AppendLen() < needed || vecs_.size() >= IOV_MAX - 2)
+    Flush(needed);
+
+  size_t this_chunk = min(scratch.AppendLen(), remaining);
+  if (this_chunk < remaining)
+    this_chunk -= this_chunk % chunk_alignment;   // align all but final
+
+  char* dest = scratch.AppendBuffer().data();
+  decode_fn(src, written, this_chunk, dest);     // decode in place
+  // extend last iovec or push new one (same pattern as WritePieces)
+  scratch.CommitWrite(this_chunk);
+  written += this_chunk;
+}
+```
+
+Intermediate chunks decode the maximum aligned amount that fits in scratch
+(typically up to `kMaxBufferSize = 8 KiB`); the final chunk handles
+whatever remains (possibly including the unaligned tail). When the scratch
+fills, `Flush()` drains it via `writev` and resets — yielding one syscall
+per ~8 KiB of decoded payload. For a 1 MiB decoded reply that's ~128
+`writev` calls; the alternative — a 1 MiB allocation and `memcpy` — costs
+~100 µs in pure copy time plus malloc overhead. The chunked path trades a
+bit of syscall overhead for zero allocation and constant memory footprint.
+
+`RedisReplyBuilderBase::SendBulkStringStreamed` is the public entry point:
+it writes the `$N\r\n` framing, calls `WriteDecodedChunks`, then writes
+the trailing `\r\n`. The `decode_fn` callback is supplied by the caller —
+keeps the reply builder ignorant of encoding specifics.
+
+### Borrow API extension
+
+`CompactObj::TryGetRaw()` returns:
+
+```cpp
+struct RawBorrow {
+  std::string_view encoded;
+  size_t decoded_size;
+  uint8_t encoding;   // NONE_ENC / ASCII1_ENC / ASCII2_ENC
+};
+```
+
+For `NONE_ENC`: `encoded` is the user-visible bytes (`encoded.size() ==
+decoded_size`). For `ASCII1/2_ENC`: `encoded` is the packed source
+(`encoded.size() < decoded_size`); `decoded_size` is computed via
+`StrEncoding::DecodedSize(packed_size, first_byte)` which knows the
+ASCII1 vs ASCII2 rounding semantics.
+
+`BorrowedString` (the variant alternative in `StringResult`) gains
+`encoding` and `decoded_size`. `CmdGet`'s `Send(BorrowedString)`
+dispatches: NONE → `SendBulkStringBorrowed`; ASCII → `SendBulkStringStreamed`
+with an `ascii_unpack_chunk` thunk.
+
+### Capture/replay (squashing, MULTI/EXEC)
+
+`reply_payload.h` gains a `BulkStringStreamed { src, decoded_size,
+decode_fn, chunk_alignment }` payload, stored via `unique_ptr` so the
+`Payload` variant alternative stays at 8 bytes (preserves `sizeof(Payload)`).
+`CapturingReplyBuilder::SendBulkStringStreamed` records this struct. The
+`CaptureVisitor` replay path calls `SendBulkStringStreamed` on the real
+sink — chunked decode survives end-to-end through the capture/replay
+boundary. Lifetime: the captured `src` pointer is the same one held by
+the `PendingRead` pin, so the encoded source survives across the replay
+window under the same CoW rules.
+
+The HTTP API's `CaptureVisitor` handles the new variant differently — it
+needs one contiguous string to JSON-escape, so it materializes a single
+allocation there. Chunked decoding is an optimization for the socket sink;
+on the HTTP path it's not worth the implementation complexity.
+
 ## What's out of scope
 
 - **MGET.** Today `CollectKeys` allocates a per-shard storage buffer
   (`make_unique<char[]>`) and packs values into it. Zero-copy MGET would
   require restructuring this path to carry borrowed views per result.
   Future work.
-- **Encoded large strings.** ASCII1/ASCII2/HUFFMAN-encoded values must
-  be decoded before reaching the wire. `TryGetRawView` returns `nullopt`
-  for them; they keep the existing `pv.ToString` path.
+- **Huffman-encoded large strings.** `TryGetRaw` returns `nullopt` for
+  `HUFFMAN_ENC`; these keep the existing `pv.ToString` path. Adding
+  chunked Huffman would require a stateful streaming decoder
+  (Huffman codes are variable-length so chunk boundaries aren't fixed
+  on the encoded side); not done here.
 - **Tiered (`EXTERNAL_TAG`) values.** Require an asynchronous disk
   fetch and live materialization; outside the zero-copy story.
 - **`SMALL_TAG` (<256 B) values.** Already cheap to copy; the
@@ -366,9 +472,11 @@ captured payload.
 
 | Concern | File |
 |---|---|
-| Bit, view accessor, orphan hook | `src/core/compact_object.{h,cc}` |
+| `read_pending` bit, `TryGetRaw`, orphan hook | `src/core/compact_object.{h,cc}` |
+| Chunked ASCII decode primitive | `src/core/detail/bitpacking.h` |
 | Per-shard pin registry + MPSC drain | `src/server/engine_shard.{h,cc}` |
-| Reply builder pin release | `src/facade/reply_builder.{h,cc}` |
-| Capture/replay override | `src/facade/reply_capture.{h,cc}` |
-| GET fast path | `src/server/string_family.cc` |
+| Reply builder pin release + `WriteDecodedChunks` + `SendBulkStringStreamed` | `src/facade/reply_builder.{h,cc}` |
+| Capture/replay overrides (borrowed + streamed) | `src/facade/reply_capture.{h,cc}`, `src/facade/reply_payload.h` |
+| GET fast path (borrow + pin + dispatch) | `src/server/string_family.cc` |
+| HTTP-API visitor materialization | `src/server/http_api.cc` |
 | Tests | `src/server/string_family_test.cc` |

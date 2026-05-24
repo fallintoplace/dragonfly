@@ -42,6 +42,21 @@ void ascii_pack_simd2(const char* ascii, size_t len, uint8_t* bin);
 
 bool compare_packed(const uint8_t* packed, const char* ascii, size_t ascii_len);
 
+// Chunked variant of ascii_unpack: decodes `count` decoded bytes starting at
+// decoded offset `dec_offset` from the encoded `src` buffer into `dest`.
+// `dec_offset` must be a multiple of 8 (i.e. chunks must start on a packed
+// group boundary). `count` may be any value: callers typically use multiples
+// of 8 for intermediate chunks and the remaining (possibly non-aligned) byte
+// count for the final chunk that covers the unpacked tail.
+inline void ascii_unpack_chunk(const uint8_t* src, size_t dec_offset, size_t count, char* dest) {
+  ascii_unpack(src + (dec_offset / 8) * 7, count, dest);
+}
+
+// Chunk alignment for ascii_unpack_chunk: chunks must start on an 8-decoded-
+// byte boundary because each group of 8 decoded bytes maps to a packed group
+// of 7 encoded bytes.
+inline constexpr size_t kAsciiChunkAlignment = 8;
+
 // maps ascii len to 7-bit packed length. Each 8 bytes are converted to 7 bytes.
 inline constexpr size_t binpacked_len(size_t ascii_len) {
   return (ascii_len * 7 + 7) / 8; /* rounded up */

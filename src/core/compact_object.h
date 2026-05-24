@@ -258,18 +258,32 @@ class CompactObj {
 
   std::string_view GetSlice(std::string* scratch) const;
 
-  // Read-only fast path. Returns a borrowed view into the underlying storage
-  // iff this CompactObj holds a raw (NONE_ENC) large string in memory — i.e.
-  // taglen_==LARGE_STR_TAG, encoding_==NONE_ENC, !IsExternal(). Returns
-  // std::nullopt otherwise (inline / int / small / encoded / external /
-  // collection / etc), in which case the caller must use the materializing
-  // path (GetSlice/GetString/ToString).
+  // Borrowed view of the underlying LargeString storage, including the
+  // encoding metadata needed to decode it. Returned by TryGetRaw().
   //
-  // The returned view is valid only as long as this CompactObj's storage is
-  // not mutated, freed, or relocated (defrag). The caller is responsible for
-  // that lifetime — see facade::SinkReplyBuilder::ReplyScope for the reply
-  // builder's contract.
-  std::optional<std::string_view> TryGetRawView() const;
+  // For NONE_ENC: `encoded` already holds the user-visible bytes and
+  // `decoded_size == encoded.size()`. The caller may stream the bytes
+  // directly to the reply.
+  // For ASCII1_ENC / ASCII2_ENC: `encoded` is the packed source
+  // (`encoded.size() < decoded_size`); the reply path is responsible for
+  // chunked decoding into its own scratch (no full decoded buffer is held
+  // anywhere).
+  struct RawBorrow {
+    std::string_view encoded;
+    size_t decoded_size;
+    uint8_t encoding;
+  };
+
+  // Read-only fast path. Returns a RawBorrow iff this CompactObj holds a
+  // non-external LARGE_STR_TAG value whose encoding is one of NONE_ENC,
+  // ASCII1_ENC, ASCII2_ENC. Returns std::nullopt otherwise (inline / int /
+  // small / Huffman-encoded / external / collection / etc) — caller must
+  // use the materializing path (GetSlice/GetString/ToString).
+  //
+  // The borrowed bytes are valid only as long as this CompactObj's storage
+  // is not mutated, freed, or relocated (defrag). Caller's responsibility —
+  // see facade::SinkReplyBuilder::ReplyScope.
+  std::optional<RawBorrow> TryGetRaw() const;
 
   // Mark the underlying LargeString as having at least one outstanding read
   // pin (Copy-on-Write hook). When a mutation runs on a read-pending value,
@@ -278,7 +292,7 @@ class CompactObj {
   //
   // Const because the bit is bookkeeping metadata about outstanding readers;
   // it does not change the logical value. Only valid to call when the value
-  // is currently LARGE_STR_TAG (i.e. TryGetRawView would succeed).
+  // is currently LARGE_STR_TAG (i.e. TryGetRaw would succeed).
   void MarkReadPending() const;
 
   std::string ToString() const {

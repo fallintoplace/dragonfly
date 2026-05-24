@@ -127,6 +127,52 @@ template <typename... Ts> void SinkReplyBuilder::WritePieces(Ts&&... pieces) {
   total_size_ += written;
 }
 
+void SinkReplyBuilder::WriteDecodedChunks(const void* src, size_t decoded_size,
+                                          StreamingDecodeFn decode_fn, size_t chunk_alignment) {
+  DCHECK(decode_fn != nullptr);
+  DCHECK_GT(chunk_alignment, 0u);
+
+  auto iovec_end = [](const iovec& v) { return reinterpret_cast<char*>(v.iov_base) + v.iov_len; };
+
+  size_t written = 0;
+  while (written < decoded_size) {
+    size_t remaining = decoded_size - written;
+    // Scratch needs to fit at least one chunk (capped at chunk_alignment for
+    // intermediate chunks; for the final chunk, `remaining` may be smaller).
+    size_t needed = std::min(remaining, chunk_alignment);
+    if (buffer_.AppendLen() < needed || vecs_.size() >= IOV_MAX - 2) {
+      // Drain and grow as needed. Intermediate flushes are expected when the
+      // decoded payload exceeds kMaxBufferSize.
+      Flush(needed);
+    }
+    size_t available = buffer_.AppendLen();
+    DCHECK_GE(available, needed);
+
+    // For all but the final chunk, round down to chunk_alignment so the
+    // decoder sees an aligned boundary. The final chunk takes everything
+    // remaining (may include an unaligned tail).
+    size_t this_chunk = std::min(available, remaining);
+    if (this_chunk < remaining)
+      this_chunk -= this_chunk % chunk_alignment;
+
+    // Decode straight into the scratch buffer's append region.
+    char* dest = reinterpret_cast<char*>(buffer_.AppendBuffer().data());
+    decode_fn(src, written, this_chunk, dest);
+
+    // Extend the last iovec if it points at the byte just before `dest`,
+    // otherwise push a new one. Right after a Flush() vecs_ is empty so the
+    // else branch fires; in steady streaming, the iovec just grows.
+    if (!vecs_.empty() && iovec_end(vecs_.back()) == dest) {
+      vecs_.back().iov_len += this_chunk;
+    } else {
+      vecs_.push_back(iovec{dest, this_chunk});
+    }
+    buffer_.CommitWrite(this_chunk);
+    total_size_ += this_chunk;
+    written += this_chunk;
+  }
+}
+
 void SinkReplyBuilder::WriteRef(std::string_view str) {
   if (vecs_.size() >= IOV_MAX - 2)
     Flush();
@@ -339,6 +385,16 @@ void RedisReplyBuilderBase::SendBulkString(std::string_view str) {
   DVLOG(1) << "SendBulk " << str.size();
   WritePieces(kLengthPrefix, uint32_t(str.size()), kCRLF);
   WriteRef(str);
+  WritePieces(kCRLF);
+}
+
+void RedisReplyBuilderBase::SendBulkStringStreamed(const void* src, size_t decoded_size,
+                                                   StreamingDecodeFn decode_fn,
+                                                   size_t chunk_alignment) {
+  ReplyScope scope(this);
+  DVLOG(1) << "SendBulkStreamed " << decoded_size;
+  WritePieces(kLengthPrefix, uint32_t(decoded_size), kCRLF);
+  WriteDecodedChunks(src, decoded_size, decode_fn, chunk_alignment);
   WritePieces(kCRLF);
 }
 

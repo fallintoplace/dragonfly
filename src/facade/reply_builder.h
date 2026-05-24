@@ -132,10 +132,28 @@ class SinkReplyBuilder {
 
   uint64_t GetLastSendTimeCycles() const;
 
+ public:
+  // Callback used by WriteDecodedChunks / SendBulkStringStreamed. Writes
+  // `count` decoded bytes starting at decoded offset `dec_offset` from the
+  // encoded source `src` into `dest`. `count` is bounded by the reply
+  // builder's scratch capacity; the final chunk may be smaller than the
+  // requested chunk_alignment if the decoded payload's tail requires it.
+  using StreamingDecodeFn = void (*)(const void* src, size_t dec_offset, size_t count, char* dest);
+
  protected:
   template <typename... Ts>
   void WritePieces(Ts&&... pieces);     // Copy pieces into buffer and reference buffer
   void WriteRef(std::string_view str);  // Add iovec bypassing buffer
+
+  // Streams a decoded payload directly into the builder's scratch buffer,
+  // emitting iovec entries. Loops over chunks: ensures the scratch has at
+  // least `chunk_alignment` bytes free, decodes the next chunk into the
+  // scratch via `decode_fn`, then extends the last iovec or pushes a new
+  // one. May Flush intermediately to drain the scratch. The full decoded
+  // payload is never held anywhere — only one chunk at a time lives in the
+  // scratch.
+  void WriteDecodedChunks(const void* src, size_t decoded_size, StreamingDecodeFn decode_fn,
+                          size_t chunk_alignment);
 
   void FinishScope();  // Called when scope ends to flush buffer if needed
   void Send();
@@ -216,6 +234,22 @@ class RedisReplyBuilderBase : public SinkReplyBuilder {
   virtual void SendBulkStringBorrowed(std::string_view str) {
     SendBulkString(str);
   }
+
+  // Streams a bulk-string reply by decoding `src` chunk-by-chunk directly
+  // into the reply builder's scratch — avoiding any full decoded buffer in
+  // either the shard or the reply path. `src` is the borrowed encoded
+  // source (e.g. CompactObj's ASCII-packed LargeString); `decoded_size` is
+  // the user-visible byte count (used both for the bulk-string length
+  // header and to drive the chunk loop). `decode_fn` decodes a sub-range
+  // of decoded bytes from `src` into a destination buffer. `chunk_alignment`
+  // is the minimum decoded-byte alignment the decoder needs (8 for ASCII
+  // packing); intermediate chunks are sized in multiples of it, with the
+  // final chunk covering any unaligned tail.
+  //
+  // Caller's pin discipline: `src` must remain valid until the next Flush
+  // completes — same contract as SendBulkStringBorrowed.
+  virtual void SendBulkStringStreamed(const void* src, size_t decoded_size,
+                                      StreamingDecodeFn decode_fn, size_t chunk_alignment);
 
   void SendLong(long val) override;
   virtual void SendDouble(double val);  // RESP: Number

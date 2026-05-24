@@ -1138,6 +1138,66 @@ TEST_F(StringFamilyTest, PendingReadPinOrphanDrain) {
   });
 }
 
+// Exercises the chunked ASCII decode path for zero-copy GET. Values must be
+// all-ASCII and > 288 bytes (so Huffman is bypassed) and large enough to
+// land in LARGE_STR_TAG (encoded size > SmallString capacity). Tests both
+// ASCII1_ENC (size not at the binpacked upper bound, e.g. 4095) and
+// ASCII2_ENC (size at the upper bound, e.g. 4096). Also crosses the
+// SinkReplyBuilder scratch flush threshold (kMaxBufferSize = 8192) to
+// validate intermediate Flushes during chunked streaming.
+TEST_F(StringFamilyTest, GetLargeAsciiBorrowedChunked) {
+  // A varied ASCII pattern catches per-byte decode errors that a uniform
+  // 'a' filler would miss.
+  auto build = [](size_t sz) {
+    std::string v(sz, 0);
+    for (size_t i = 0; i < sz; ++i)
+      v[i] = static_cast<char>(0x20 + (i % 0x5F));  // printable ASCII range
+    return v;
+  };
+
+  struct Case {
+    size_t size;
+    const char* label;
+  };
+  Case cases[] = {
+      {2048, "2KiB-ASCII1 (within scratch)"},
+      {4095, "ASCII1 (one-below alignment)"},
+      {4096, "ASCII2 (alignment boundary)"},
+      {16384, "16KiB (crosses scratch flush)"},
+  };
+  for (const Case& c : cases) {
+    std::string value = build(c.size);
+    EXPECT_THAT(Run({"set", "k", value}), "OK") << c.label;
+    auto resp = Run({"get", "k"});
+    EXPECT_EQ(resp, value) << c.label << " size=" << c.size;
+  }
+}
+
+// Same as above but inside MULTI/EXEC to exercise the
+// CapturingReplyBuilder::SendBulkStringStreamed override + visitor replay
+// path. Without the override, captured ASCII-encoded GETs would silently
+// fall back to the materializing SendBulkString.
+TEST_F(StringFamilyTest, GetLargeAsciiBorrowedChunkedSquashed) {
+  auto build = [](size_t sz) {
+    std::string v(sz, 0);
+    for (size_t i = 0; i < sz; ++i)
+      v[i] = static_cast<char>(0x20 + (i % 0x5F));
+    return v;
+  };
+
+  std::string v0 = build(4096);
+  std::string v1 = build(16384);
+
+  EXPECT_THAT(Run({"set", "k0", v0}), "OK");
+  EXPECT_THAT(Run({"set", "k1", v1}), "OK");
+
+  EXPECT_EQ(Run({"multi"}), "OK");
+  EXPECT_EQ(Run({"get", "k0"}), "QUEUED");
+  EXPECT_EQ(Run({"get", "k1"}), "QUEUED");
+  auto resp = Run({"exec"});
+  EXPECT_THAT(resp, RespArray(ElementsAre(v0, v1)));
+}
+
 // Drain on a non-orphaned entry (no mutation during the read window) just
 // removes the entry from the map without freeing the buffer; the caller
 // retains ownership of the buffer for normal lifecycle management.

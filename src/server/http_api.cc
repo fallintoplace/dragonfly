@@ -123,6 +123,20 @@ struct CaptureVisitor {
     absl::StrAppend(&str, JsonEscape(bs.view));
   }
 
+  void operator()(const unique_ptr<payload::BulkStringStreamed>& bs) {
+    // Materialize the decoded payload to a stack/string scratch since the
+    // HTTP visitor wants a single contiguous string to JSON-escape. The
+    // chunked-decode optimization is only worthwhile for the iovec/socket
+    // sink path; here we just decode in one shot.
+    if (!bs) {
+      absl::StrAppend(&str, "null");
+      return;
+    }
+    std::string decoded(bs->decoded_size, '\0');
+    bs->decode_fn(bs->src, 0, bs->decoded_size, decoded.data());
+    absl::StrAppend(&str, JsonEscape(decoded));
+  }
+
   void operator()(payload::Null) {
     absl::StrAppend(&str, "null");
   }

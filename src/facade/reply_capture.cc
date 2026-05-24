@@ -63,6 +63,19 @@ void CapturingReplyBuilder::SendBulkStringBorrowed(std::string_view str) {
   Capture(BulkStringView{str});
 }
 
+// Streamed variant: store the encoded source + decode function so replay can
+// chunk-decode directly into the real sink's scratch. The encoded source is
+// borrowed (same lifetime contract as BulkStringBorrowed); no full decoded
+// buffer is materialized. Heap-allocated descriptor keeps the Payload
+// variant alternative at 8 bytes.
+void CapturingReplyBuilder::SendBulkStringStreamed(const void* src, size_t decoded_size,
+                                                   StreamingDecodeFn decode_fn,
+                                                   size_t chunk_alignment) {
+  SKIP_LESS(ReplyMode::FULL);
+  Capture(std::make_unique<BulkStringStreamed>(
+      BulkStringStreamed{src, decoded_size, decode_fn, chunk_alignment}));
+}
+
 void CapturingReplyBuilder::StartCollection(unsigned len, CollectionType type) {
   SKIP_LESS(ReplyMode::FULL);
   stack_.emplace(make_unique<CollectionPayload>(len, type),
@@ -137,8 +150,21 @@ struct CaptureVisitor {
     // path uses WriteRef (iovec) so the bytes flow straight through without
     // an intermediate copy. The view's underlying bytes must still be valid
     // here, which holds under the read-only invariant documented at the
-    // borrow source (CompactObj::TryGetRawView).
+    // borrow source (CompactObj::TryGetRaw).
     static_cast<RedisReplyBuilder*>(rb)->SendBulkString(bs.view);
+  }
+
+  void operator()(const std::unique_ptr<payload::BulkStringStreamed>& bs) {
+    // Replay via the real sink's streaming path so the captured ASCII-packed
+    // source decodes chunk-by-chunk into the real sink's scratch — no full
+    // decoded buffer is materialized here. The encoded source's lifetime is
+    // managed by the pin discipline at the borrow source.
+    if (!bs) {
+      static_cast<RedisReplyBuilder*>(rb)->SendNull();
+      return;
+    }
+    static_cast<RedisReplyBuilder*>(rb)->SendBulkStringStreamed(bs->src, bs->decoded_size,
+                                                                bs->decode_fn, bs->chunk_alignment);
   }
 
   void operator()(payload::Null) {

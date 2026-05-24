@@ -984,12 +984,21 @@ void CompactObj::MarkReadPending() const {
   const_cast<detail::LargeString&>(u_.large_str).SetReadPending(true);
 }
 
-std::optional<std::string_view> CompactObj::TryGetRawView() const {
-  if (encoding_ != NONE_ENC)
-    return std::nullopt;
+std::optional<CompactObj::RawBorrow> CompactObj::TryGetRaw() const {
   if (taglen_ != LARGE_STR_TAG)
     return std::nullopt;
-  return u_.large_str.AsView();
+  if (encoding_ != NONE_ENC && encoding_ != ASCII1_ENC && encoding_ != ASCII2_ENC)
+    return std::nullopt;
+  auto view = u_.large_str.AsView();
+  size_t decoded_size;
+  if (encoding_ == NONE_ENC) {
+    decoded_size = view.size();
+  } else {
+    // ASCII1_ENC / ASCII2_ENC: derive decoded size from packed length and
+    // first byte (StrEncoding::DecodedSize knows the rounding semantics).
+    decoded_size = GetStrEncoding().DecodedSize(view.size(), *(uint8_t*)view.data());
+  }
+  return RawBorrow{view, decoded_size, encoding_};
 }
 
 string_view CompactObj::GetSlice(string* scratch) const {

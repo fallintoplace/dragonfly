@@ -32,6 +32,8 @@ class CapturingReplyBuilder : public RedisReplyBuilder {
   void SendSimpleString(std::string_view str) override;
   void SendBulkString(std::string_view str) override;
   void SendBulkStringBorrowed(std::string_view str) override;
+  void SendBulkStringStreamed(const void* src, size_t decoded_size, StreamingDecodeFn decode_fn,
+                              size_t chunk_alignment) override;
 
   void StartCollection(unsigned len, CollectionType type) override;
   void SendNullArray() override;
