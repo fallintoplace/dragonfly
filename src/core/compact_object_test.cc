@@ -906,11 +906,9 @@ TEST_F(CompactObjectTest, LargeStringSetReplacesContents) {
   EXPECT_EQ(ls.Size(), longer_str.size());
   EXPECT_EQ(ls.AsView(), longer_str);
 
-  // 5. Replace with an empty string.
-  ls.SetString("", mr);
-  EXPECT_EQ(ls.Size(), 0u);
-
+  // 5. Free() clears the value.
   ls.Free(mr);
+  EXPECT_EQ(ls.Size(), 0u);
 }
 
 TEST_F(CompactObjectTest, ExternalRepresentation) {
@@ -1271,6 +1269,123 @@ TEST_F(CompactObjectTest, SetByteAtOffset) {
     EXPECT_EQ(0u, res);
   }
 
+  cobj_.Reset();
+}
+
+// --- Zero-copy GET primitives (TryGetRaw / PinRead / DrainPendingReads) ---
+
+TEST_F(CompactObjectTest, TryGetRaw_NulloptForNonLargeStr) {
+  cobj_.SetString("hello");
+  EXPECT_FALSE(cobj_.TryGetRaw().has_value());
+
+  cobj_.SetString("12345");
+  EXPECT_FALSE(cobj_.TryGetRaw().has_value());
+
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryGetRaw_NoneEncLargeString) {
+  // 300 non-ASCII bytes → NONE_ENC + LARGE_STR_TAG (no compression applied).
+  string val(300, '\x80');
+  cobj_.SetString(val);
+  ASSERT_EQ(cobj_.Encoding(), 0u);  // NONE_ENC == 0
+
+  auto borrow = cobj_.TryGetRaw();
+  ASSERT_TRUE(borrow.has_value());
+  EXPECT_EQ(borrow->encoding, 0u);  // NONE_ENC
+  EXPECT_EQ(borrow->decoded_size, val.size());
+  EXPECT_EQ(borrow->encoded, val);
+  ASSERT_NE(borrow->pin, nullptr);
+  EXPECT_EQ(borrow->pin->refcnt.load(), 1u);
+
+  borrow->pin->UnpinRead();
+  CompactObj::DrainPendingReads();
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryGetRaw_AsciiLargeString) {
+  // 300 ASCII bytes: packed size (263) exceeds SmallString::kMaxSize (255),
+  // so the value ends up as ASCII1_ENC or ASCII2_ENC + LARGE_STR_TAG.
+  string val(300, 'a');
+  for (size_t i = 0; i < val.size(); ++i)
+    val[i] = char('a' + (i % 26));
+  cobj_.SetString(val);
+
+  auto borrow = cobj_.TryGetRaw();
+  ASSERT_TRUE(borrow.has_value());
+  EXPECT_TRUE(borrow->encoding == 1u || borrow->encoding == 2u);  // ASCII1 or ASCII2
+  EXPECT_EQ(borrow->decoded_size, val.size());
+  EXPECT_LT(borrow->encoded.size(), val.size());  // packed representation is smaller
+
+  // Verify the packed bytes decode back to the original string.
+  string decoded(borrow->decoded_size, '\0');
+  detail::ascii_unpack(reinterpret_cast<const uint8_t*>(borrow->encoded.data()),
+                       borrow->decoded_size, decoded.data());
+  EXPECT_EQ(decoded, val);
+
+  borrow->pin->UnpinRead();
+  CompactObj::DrainPendingReads();
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryGetRaw_PinRefcountAndDrain) {
+  string val(300, '\x80');
+  cobj_.SetString(val);
+
+  auto b1 = cobj_.TryGetRaw();
+  auto b2 = cobj_.TryGetRaw();
+  ASSERT_TRUE(b1.has_value() && b2.has_value());
+  EXPECT_EQ(b1->pin, b2->pin);  // same underlying buffer → same PendingRead
+  EXPECT_EQ(b1->pin->refcnt.load(), 2u);
+
+  // Drain must not reap an entry with outstanding references.
+  CompactObj::DrainPendingReads();
+  EXPECT_EQ(b1->pin->refcnt.load(), 2u);
+
+  b1->pin->UnpinRead();
+  EXPECT_EQ(b2->pin->refcnt.load(), 1u);
+  CompactObj::DrainPendingReads();  // still live
+  EXPECT_EQ(b2->pin->refcnt.load(), 1u);
+
+  b2->pin->UnpinRead();
+  CompactObj::DrainPendingReads();  // entry is now reaped; do not dereference pin after this
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryGetRaw_CowOnMutation) {
+  string val(3000, '\x80');
+  cobj_.SetString(val);
+
+  auto borrow = cobj_.TryGetRaw();
+  ASSERT_TRUE(borrow.has_value());
+  detail::PendingRead* pin = borrow->pin;
+
+  // Mutate the value while the read pin is still held.
+  string new_val(3000, '\x81');
+  cobj_.SetString(new_val);
+
+  // SetString must have orphaned the old buffer rather than freeing it inline.
+  EXPECT_TRUE(pin->orphaned);
+  EXPECT_EQ(cobj_.ToString(), new_val);
+
+  // Release the pin; drain frees the orphaned old buffer.
+  pin->UnpinRead();
+  CompactObj::DrainPendingReads();
+  cobj_.Reset();
+}
+
+TEST_F(CompactObjectTest, TryGetRaw_DefragSkipsWhenPinned) {
+  string val(300, '\x80');
+  cobj_.SetString(val);
+
+  auto borrow = cobj_.TryGetRaw();
+  ASSERT_TRUE(borrow.has_value());
+
+  PageUsage page_usage{CollectPageStats::NO, 0.8};
+  EXPECT_FALSE(cobj_.DefragIfNeeded(&page_usage));
+
+  borrow->pin->UnpinRead();
+  CompactObj::DrainPendingReads();
   cobj_.Reset();
 }
 

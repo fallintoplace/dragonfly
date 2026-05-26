@@ -20,6 +20,7 @@ extern "C" {
 #include "redis/util.h"
 #include "redis/zmalloc.h"  // for non-string objects.
 }
+#include <absl/container/flat_hash_map.h>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/strip.h>
 
@@ -428,6 +429,12 @@ struct TL {
   Huffman huff_keys, huff_string_values;
   uint64_t huff_encode_total = 0, huff_encode_success = 0;  // success/total metrics.
 
+  // Zero-copy GET pin registry. Single-threaded (owning thread only).
+  // Other threads only touch individual PendingRead::refcnt via UnpinRead;
+  // CompactObj::DrainPendingReads iterates this map and reaps refcnt==0
+  // entries on this thread.
+  absl::flat_hash_map<void*, detail::PendingRead*> pin_map;
+
   const HuffmanDecoder& GetHuffmanDecoder(uint8_t huffman_domain) const {
     return huffman_domain == CompactObj::HUFF_KEYS ? huff_keys.decoder : huff_string_values.decoder;
   }
@@ -491,6 +498,30 @@ static_assert(sizeof(CompactObj) == 18);
 
 namespace detail {
 
+// Release ls->ptr: orphan to its PendingRead if pinned, else deallocate.
+// Tolerates a stale-set read_pending bit (entry already drained) — the
+// map lookup either finds the active pin or falls through to deallocate.
+// Precondition: ls->ptr != nullptr.
+static void ReleasePtr(LargeString* ls, LargeString::MemoryResource* mr) {
+  DCHECK(ls->ptr != nullptr);
+  bool orphaned = false;
+  if (ls->read_pending) {
+    auto it = tl.pin_map.find(ls->ptr);
+    if (it != tl.pin_map.end()) {
+      // Mark the buffer as orphaned; DrainPendingReads will free it and erase
+      // the map slot once refcnt drops to zero. Keeping the entry in the map
+      // is safe: the address cannot be recycled until DrainPendingReads frees
+      // the buffer, at which point it also erases the entry.
+      it->second->orphaned = true;
+      orphaned = true;
+    }
+  }
+  if (!orphaned)
+    mr->deallocate(ls->ptr, 0, kAlignSize);
+  ls->ptr = nullptr;
+  ls->read_pending = 0;
+}
+
 size_t LargeString::MallocUsed() const {
   return zmalloc_size(ptr);
 }
@@ -501,15 +532,17 @@ uint64_t LargeString::HashCode() const {
 }
 
 void LargeString::SetString(string_view s, MemoryResource* mr) {
-  if (s.size() > zmalloc_size(ptr)) {
-    if (ptr) {
-      mr->deallocate(ptr, 0, kAlignSize);
-    }
+  DCHECK(!s.empty());
+
+  // Force a fresh buffer when either (a) the new value doesn't fit, or
+  // (b) read_pending is set (in-place overwrite would corrupt pinned readers;
+  // ReleasePtr hands the old buffer to its PendingRead).
+  if (s.size() > zmalloc_size(ptr) || read_pending) {
+    if (ptr)
+      ReleasePtr(this, mr);
     ptr = mr->allocate(s.size(), kAlignSize);
   }
-  if (!s.empty()) {
-    memcpy(ptr, s.data(), s.size());
-  }
+  memcpy(ptr, s.data(), s.size());
   sz = s.size();
 }
 
@@ -521,6 +554,9 @@ void LargeString::ReserveString(size_t size, MemoryResource* mr) {
 void LargeString::AppendString(string_view s, MemoryResource* mr) {
   size_t cur_cap = zmalloc_size(ptr);
   CHECK(cur_cap >= sz + s.size()) << cur_cap << " " << sz << " " << s.size();
+  // In-place append would corrupt pinned readers. Today's only caller
+  // (rdb_load) never produces pinned values.
+  DCHECK(!read_pending);
   memcpy(reinterpret_cast<uint8_t*>(ptr) + sz, s.data(), s.size());
   sz += s.size();
 }
@@ -528,13 +564,14 @@ void LargeString::AppendString(string_view s, MemoryResource* mr) {
 void LargeString::Free(MemoryResource* mr) {
   if (!ptr)
     return;
-
-  mr->deallocate(ptr, 0, 8);  // we do not keep the allocated size.
-  ptr = nullptr;
+  ReleasePtr(this, mr);
   sz = 0;
 }
 
 bool LargeString::DefragIfNeeded(PageUsage* page_usage) {
+  // Reallocation would invalidate any borrowed view; skip if pinned.
+  if (read_pending)
+    return false;
   if (page_usage->IsPageForObjectUnderUtilized(ptr)) {
     ReallocateString(tl.local_mr);
     return true;
@@ -570,6 +607,47 @@ auto CompactObj::GetStatsThreadLocal() -> Stats {
 void CompactObj::InitThreadLocal(MemoryResource* mr) {
   tl.local_mr = mr;
   tl.tmp_buf = base::PODArray<uint8_t>{mr};
+}
+
+static detail::PendingRead* PinRead(void* ptr) {
+  DCHECK(ptr != nullptr);
+  auto [it, inserted] = tl.pin_map.try_emplace(ptr, nullptr);
+  if (inserted) {
+    auto* pin = new detail::PendingRead{};
+    pin->ptr = ptr;
+    pin->refcnt.store(1, std::memory_order_relaxed);
+    it->second = pin;
+    return pin;
+  }
+  it->second->refcnt.fetch_add(1, std::memory_order_relaxed);
+  return it->second;
+}
+
+void CompactObj::DrainPendingReads() {
+  // Iterate the map (owning-thread only) and reap entries whose refcnt
+  // has been decremented to zero. Safe to delete here because UnpinRead's
+  // only memory access on the pin is the fetch_sub itself; once that
+  // returns on the IO thread the pin pointer is no longer referenced.
+  for (auto it = tl.pin_map.begin(); it != tl.pin_map.end();) {
+    auto* pin = it->second;
+    // acquire pairs with UnpinRead's release-store.
+    if (pin->refcnt.load(std::memory_order_acquire) > 0) {
+      ++it;
+      continue;
+    }
+    if (pin->orphaned)
+      tl.local_mr->deallocate(pin->ptr, 0, 8);
+    auto next = std::next(it);
+    tl.pin_map.erase(it);
+    it = next;
+    delete pin;
+  }
+}
+
+void detail::PendingRead::UnpinRead() {
+  // Single atomic op. After this returns, the caller MUST NOT touch the pin
+  // again — the owning thread may reap it on the next drain.
+  refcnt.fetch_sub(1, std::memory_order_release);
 }
 
 bool CompactObj::InitHuffmanThreadLocal(HuffmanDomain domain, std::string_view hufftable) {
@@ -1025,6 +1103,27 @@ void CompactObj::ReserveString(size_t size) {
 void CompactObj::AppendString(std::string_view str) {
   DCHECK_EQ(taglen_, LARGE_STR_TAG);
   u_.large_str.AppendString(str, tl.local_mr);
+}
+
+std::optional<CompactObj::RawBorrow> CompactObj::TryGetRaw() const {
+  if (taglen_ != LARGE_STR_TAG)
+    return std::nullopt;
+  if (encoding_ != NONE_ENC && encoding_ != ASCII1_ENC && encoding_ != ASCII2_ENC)
+    return std::nullopt;
+  auto view = u_.large_str.AsView();
+  size_t decoded_size;
+  if (encoding_ == NONE_ENC) {
+    decoded_size = view.size();
+  } else {
+    // ASCII1_ENC / ASCII2_ENC: derive decoded size from packed length and
+    // first byte (StrEncoding::DecodedSize knows the rounding semantics).
+    decoded_size = GetStrEncoding().DecodedSize(view.size(), *(uint8_t*)view.data());
+  }
+  // Register the pin and stamp read_pending. The bit is bookkeeping; safe to
+  // mutate via const_cast.
+  detail::PendingRead* pin = PinRead(const_cast<void*>(static_cast<const void*>(view.data())));
+  const_cast<detail::LargeString&>(u_.large_str).read_pending = 1;
+  return RawBorrow{view, decoded_size, encoding_, pin};
 }
 
 string_view CompactObj::GetSlice(string* scratch) const {

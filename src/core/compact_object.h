@@ -6,6 +6,7 @@
 
 #include <absl/base/internal/endian.h>
 
+#include <atomic>
 #include <optional>
 #include <type_traits>
 
@@ -94,7 +95,11 @@ struct LargeString {
 
   void* ptr;
   uint64_t sz : 56;
-  uint64_t reserved : 8;
+
+  // Hint: outstanding readers may be borrowing `ptr`. Mutations consult
+  // TL::pin_map and hand the buffer to its PendingRead instead of freeing.
+  uint64_t read_pending : 1;
+  uint64_t reserved : 7;
 
   size_t Size() const {
     return sz;
@@ -113,6 +118,7 @@ struct LargeString {
   }
 
   // Replace contents with s, growing the underlying allocation if needed.
+  // Precondition: !s.empty(). Use Free() for clearing a value.
   void SetString(std::string_view s, MemoryResource* mr);
 
   // Allocate room for `size` bytes; ptr must be null.
@@ -132,6 +138,21 @@ struct LargeString {
 } __attribute__((packed));
 
 static_assert(sizeof(LargeString) == 16);
+
+// In-flight read pins on a single LargeString buffer. If a writer mutates
+// the value during the pin window, the entry is marked `orphaned` and
+// becomes the buffer's owner; otherwise the buffer stays with its
+// CompactObj. The owning thread reaps entries with refcnt==0 via
+// CompactObj::DrainPendingReads.
+struct PendingRead {
+  void* ptr = nullptr;
+  std::atomic<uint32_t> refcnt{0};
+  bool orphaned = false;  // Not referenced by CompactObj anymore; must be freed when refcnt==0.
+
+  // Any-thread: decrement refcnt. After this returns, the caller must not
+  // touch the pin again — the owning thread may reap it on the next drain.
+  void UnpinRead();
+};
 
 }  // namespace detail
 
@@ -241,6 +262,34 @@ class CompactObj {
   size_t Size() const;
 
   std::string_view GetSlice(std::string* scratch) const;
+
+  // Borrowed view of the underlying LargeString storage, including the
+  // encoding metadata needed to decode it and the registered read pin.
+  // Returned by TryGetRaw().
+  //
+  // For NONE_ENC: `encoded` is the user-visible bytes; the reply can stream
+  // them directly. For ASCII1/ASCII2_ENC: `encoded` is the packed source
+  // (`encoded.size() < decoded_size`) and the reply must decode in chunks.
+  //
+  // `pin` is the PendingRead registered for the buffer; caller is responsible
+  // for releasing it (via PendingRead::UnpinRead) once the reply has been
+  // written to the wire.
+  struct RawBorrow {
+    std::string_view encoded;
+    size_t decoded_size;
+    uint8_t encoding;
+    detail::PendingRead* pin;
+  };
+
+  // Read-only fast path. Returns a RawBorrow iff this CompactObj holds a
+  // string value that can be borrowed, otherwise std::nullopt (caller uses
+  // GetSlice/GetString/ToString). The borrowed bytes are valid until the
+  // pin is released.
+  //
+  // Side effects on success: stamps the LargeString's read_pending bit and
+  // registers a PendingRead in the thread-local pin map. Caller must
+  // release the returned pin once the reply is on the wire.
+  std::optional<RawBorrow> TryGetRaw() const;
 
   std::string ToString() const {
     std::string res;
@@ -449,6 +498,11 @@ class CompactObj {
 
   static Stats GetStatsThreadLocal();
   static void InitThreadLocal(MemoryResource* mr);
+
+  // Iterate the thread-local pin map and reap entries with refcnt==0:
+  // free orphaned buffers, erase the map slot. Typically called from
+  // EngineShard::Heartbeat.
+  static void DrainPendingReads();
 
   enum HuffmanDomain : uint8_t {
     HUFF_KEYS = 0,
