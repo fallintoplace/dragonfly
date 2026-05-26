@@ -94,11 +94,14 @@ void OffloadListNode(QList* ql, QList::Node* node) {
 void LoadListNode(QList* ql, QList::Node* node) {
   TieredStorage* ts = EngineShard::tlocal()->tiered_storage();
   DCHECK(ts);
+  node->load_pending = 1;
   QList::stats.onload_requests++;
   auto res = ReadTieredListNode(ql->GetDbIndex(), ql, node, node->GetExternalSlice(), ts).Get();
   if (!res) {
     LOG(WARNING) << "Failed to load list node from tiered storage: " << res.error().message();
   }
+  node->offloaded = 0;
+  node->load_pending = 0;
 }
 
 void CleanupListNode(QList* ql, QList::Node* node) {
@@ -148,8 +151,9 @@ class ListWrapper {
           .offload = OffloadListNode,
           .load = LoadListNode,
           .cleanup = CleanupListNode,
+          .node_load_ec = std::make_unique<util::fb2::EventCount>(),
       };
-      ql->EnableTiering(params);
+      ql->EnableTiering(std::move(params));
     }
 
     if (uint32_t zstd_thresh = GetFlag(FLAGS_list_experimental_zstd_dict_threshold);
@@ -232,6 +236,16 @@ class ListWrapper {
 
   void Push(string_view value, QList::Where where) {
     VisitMut([&](auto& list) { PushInternal(value, where, list); });
+  }
+
+  void Materialize(QList::Where where) {
+    return visit(Overload{[&](QList* ql) {
+                            QList::Node* node = const_cast<QList::Node*>(
+                                where == QList::HEAD ? ql->Head() : ql->Tail());
+                            ql->Materialize(node);
+                          },
+                          [&](const LP& lp) { return; }},
+                 impl_);
   }
 
   string First(QList::Where where) const {
@@ -400,6 +414,8 @@ std::string OpBPop(Transaction* t, EngineShard* shard, std::string_view key, Lis
 
   ListWrapper lw = GetLW(t->GetDbContext().db_index, it->second);
   QList::Where where = ToWhere(dir);
+  // This is sync point for tiered nodes. Node needs to be materialized before Pop is called.
+  lw.Materialize(where);
   value = lw.Pop(where);
   lw.Launder(&it->second);
   len = lw.Size();
